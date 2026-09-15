@@ -1,5 +1,6 @@
 import { app } from "../../scripts/app.js";
 import { t } from "./i18n.js";
+import { repairComposerWidgetValues } from "./anima_prompt_composer_defaults.js";
 import { getEntryPreviewUrl } from "./anima_prompt_composer_preview.js";
 import { enablePartialExecutionSeedControl } from "./anima_prompt_composer_seed_control.js";
 
@@ -71,6 +72,9 @@ function setupComposerNode(node) {
     if (!node) return;
     node._animaComposerImages = node._animaComposerImages || new Map();
     enablePartialExecutionSeedControl(getWidget(node, "seed"));
+    // A widget that was added after this workflow was saved comes back as `null`,
+    // which the queue rejects before the node runs; give it its default again.
+    repairComposerWidgetValues(node);
     hydrateComposerResolvedState(node);
     hideInternalWidgets(node);
     ensureComposerControls(node);

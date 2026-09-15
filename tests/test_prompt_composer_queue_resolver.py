@@ -60,6 +60,15 @@ WIDGET_DEFAULTS = {
     "clothing_source": "author",
 }
 
+# `widgets_values` as the frontend writes it: its own `control_after_generate`
+# combo is inserted right after `seed` and serialized in the workflow, so it takes
+# a position without being sent to the prompt.
+SERIALIZED_WIDGET_ORDER = (
+    *WIDGET_ORDER[:7],
+    "control_after_generate",
+    *WIDGET_ORDER[7:],
+)
+
 RESOLVE_INPUT_NAMES = tuple(
     name for name in WIDGET_ORDER if name not in ("preview_collapsed", "resolved_prompt")
 )
@@ -109,7 +118,7 @@ class AnimaPromptComposerQueueResolverTests(unittest.TestCase):
                     {
                         "id": int(NODE_ID),
                         "type": "AnimaPromptComposer",
-                        "widgets_values": [values[name] for name in WIDGET_ORDER],
+                        "widgets_values": [values.get(name) for name in SERIALIZED_WIDGET_ORDER],
                     }
                 ]
             }
