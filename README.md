@@ -185,7 +185,7 @@
 *   `character_keep_features` (Boolean): 是否把发色、瞳色等身份特征词固定跟在触发词后面（同属性的冲突颜色只保留一个，性别词始终不带）。
 *   `clothing_source` (Combo: `author` / `danbooru` / `character_tags` / `random`):
     *   `author`: 使用内置服装图库（默认，保持原有行为）。
-    *   `danbooru`: 从 Danbooru 标签组中随机搭配服装。主服装在 **上装 + 下装 / 制服 / 传统服饰** 中三选一，再叠加装饰、袜子与鞋子。
+    *   `danbooru`: 从 Danbooru 标签组中随机搭配服装。主服装在 **上装 + 下装 / 制服 / 传统服饰** 中三选一，再叠加装饰、袜子与鞋子。`uniform` / `traditional` 两个主服装池只保留整套服装，`geta`、`tabi`、`hood`、`cape`、`haori` 等单件与配饰已归入对应的鞋袜 / 上衣 / 配饰槽，不会再被当成整套服装而出现「没有主服装」或「两双鞋」的搭配。
     *   `character_tags`: 借用其它角色官方 Tags 中属于服装的词。
     *   `random`: 每次运行在以上三种来源中随机挑一种。
 *   `preview_collapsed` (Boolean): 控制节点上的随机结果预览是否折叠。
@@ -193,6 +193,8 @@
 
 > [!NOTE]
 > 新增参数一律追加在 `resolved_prompt` 之后，因此旧工作流的 `widgets_values` 位置保持不变，升级后行为与升级前一致。
+>
+> 这些新增输入同时是**可选输入**（`optional`）而非必填：ComfyUI 校验时会对 `INPUT_TYPES` 中缺失的 `required` 输入报 `required_input_missing`，Python 参数默认值无法绕过该校验，所以若放在 `required`，3.2.9 保存的 API 工作流会直接校验失败。放在 `optional` 后，缺失时由节点签名在运行时补默认值，旧 API 工作流照常可用。
 
 ### 5. 🧩 Anima Multi LoRA Loader (多 LoRA 加载器)
 *   `model`: ComfyUI 标准模型输入。

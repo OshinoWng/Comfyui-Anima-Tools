@@ -18,6 +18,14 @@ Section -> slot mapping (slots are intentionally mutually filterable, see
 * ``uniform``     <- "Uniforms and Costumes"
 * ``traditional`` <- "Traditional Clothing"
 
+The sections are then normalised so that every tag lives in exactly one slot:
+the wiki files several single garments and accessories (``geta``, ``hood``,
+``haori``, ...) under a main-outfit section and lists a few tags twice, and the
+node treats a slot entry as something it can build a whole outfit from.
+``SLOT_OVERRIDES`` names the owner of those tags and ``SLOT_PRIORITY`` settles
+whatever is left, so ``uniform`` and ``traditional`` only ever hold complete
+outfits.
+
 Tags are dropped when they have fewer than ``--min-posts`` Danbooru posts so that
 obscure entries never reach a prompt.  Post counts come from the public tags API
 and can also be read from a local copy of the community
@@ -33,6 +41,7 @@ Usage::
     python3 tools/fetch_danbooru_attire.py --min-posts 200
     python3 tools/fetch_danbooru_attire.py --tags-csv /tmp/danbooru.csv
     python3 tools/fetch_danbooru_attire.py --dry-run            # print counts only
+    python3 tools/fetch_danbooru_attire.py --reassign js/danbooru_attire_data.json
 
 The script only performs read-only GET requests to the public Danbooru API.
 """
@@ -95,6 +104,67 @@ TAG_BLOCKLIST = frozenset(
 SLOT_EXCLUDE: dict[str, frozenset[str]] = {
     "top": frozenset({"deel", "dress", "nightgown", "robe", "sweater dress"}),
 }
+
+# `tag group:attire` is organised by `h4` section, which mixes complete outfits
+# with the garments and accessories that make one up: `geta` and `tabi` are filed
+# with traditional clothing, `hood` and `cape` with uniforms.  The node draws one
+# *complete* main outfit (`uniform` / `traditional` / a `top` + `bottom` pair) and
+# then layers decoration, socks and shoes on top, so a lone garment in a main slot
+# produces a prompt without an outfit - and, for `geta`, a second pair of shoes.
+# Every tag therefore has to live in exactly one slot.
+#
+# This table names the slot that owns a tag.  It wins over the section mapping and
+# over `SLOT_PRIORITY`, so a wiki refresh keeps the correction.
+SLOT_OVERRIDES: dict[str, str] = {
+    # Footwear and legwear that "Traditional Clothing" lists next to kimono.
+    "geta": "shoes",
+    "tabi": "socks",
+    # Accessories and single garments that "Uniforms and Costumes" lists next to
+    # complete outfits.
+    "apron": "decoration",
+    "cape": "decoration",
+    "capelet": "decoration",
+    "hood": "decoration",
+    "side cape": "decoration",
+    "buruma": "bottom",
+    "loincloth": "bottom",
+    "sweatpants": "bottom",
+    "tutu": "bottom",
+    "sweater": "top",
+    # Traditional wear that is only part of an outfit.
+    "chanchanko (clothes)": "top",
+    "dotera (clothes)": "top",
+    "happi": "top",
+    "haori": "top",
+    "hanten (clothes)": "top",
+    "mizu happi": "top",
+    "fundoshi": "bottom",
+    "hakama": "bottom",
+    "hakama pants": "bottom",
+    "hakama short skirt": "bottom",
+    "hakama skirt": "bottom",
+    "kimono skirt": "bottom",
+    "budget sarashi": "decoration",
+    "chest sarashi": "decoration",
+    "midriff sarashi": "decoration",
+    "sarashi": "decoration",
+    "undone sarashi": "decoration",
+    "tasuki": "decoration",
+    # Filed under both "Uniforms and Costumes" and "Traditional Clothing".
+    "miko": "uniform",
+    "nontraditional miko": "uniform",
+    # Accessories that "Jewelry and Accessories" shares with another section.
+    "sash": "decoration",
+    "shoulder sash": "decoration",
+    "stole": "decoration",
+    "sarong": "bottom",
+}
+
+# Fallback for a tag that several sections list and that SLOT_OVERRIDES does not
+# name yet: the first slot of this order wins.  Garment, accessory and footwear
+# slots come before the main-outfit slots, so a garment is never promoted into a
+# complete outfit.
+SLOT_PRIORITY = ("shoes", "socks", "bottom", "top", "decoration", "uniform", "traditional")
 
 HEADING_RE = re.compile(r"^h(?P<level>[0-9])#[^.]*\.\s*(?P<title>.+?)\s*$")
 LINK_RE = re.compile(r"\[\[(?P<target>[^\]|]+)(?:\|[^\]]*)?\]\]")
@@ -238,6 +308,55 @@ def fetch_post_counts(min_posts: int) -> dict[str, int]:
     return counts
 
 
+def assign_slot_owners(candidates: dict[str, list[str]]) -> dict[str, str]:
+    """Return ``{tag: slot}`` with every tag owned by exactly one slot.
+
+    ``candidates`` maps a slot to the tags its sections list.  ``SLOT_OVERRIDES``
+    decides first, and tags that several slots list fall back to ``SLOT_PRIORITY``
+    so the outcome does not depend on which section was read first.
+    """
+    unknown = sorted({slot for slot in SLOT_OVERRIDES.values() if slot not in SLOT_ORDER})
+    if unknown:
+        raise ValueError(f"SLOT_OVERRIDES points outside SLOT_ORDER: {', '.join(unknown)}")
+
+    owners: dict[str, str] = {}
+
+    for slot in SLOT_ORDER:
+        for tag in candidates.get(slot, ()):
+            override = SLOT_OVERRIDES.get(tag)
+            current = owners.get(tag)
+            if override is not None:
+                owners[tag] = override
+            elif current is None:
+                owners[tag] = slot
+            else:
+                owners[tag] = min(current, slot, key=SLOT_PRIORITY.index)
+
+    return owners
+
+
+def pools_from_owners(owners: dict[str, str]) -> dict[str, list[str]]:
+    pools: dict[str, list[str]] = {}
+    for slot in SLOT_ORDER:
+        pools[slot] = sorted(tag for tag, owner in owners.items() if owner == slot)
+    return pools
+
+
+def report_slot_moves(candidates: dict[str, list[str]], owners: dict[str, str]) -> None:
+    """Print the tags the slot assignment pulled out of the section it was in."""
+    listed = {tag: slot for slot in SLOT_ORDER for tag in candidates.get(slot, ())}
+    stale = sorted(set(SLOT_OVERRIDES) - set(listed))
+    if stale:
+        print(f"  SLOT_OVERRIDES has no match in the wiki any more: {', '.join(stale)}", flush=True)
+
+    moved = sorted(tag for tag, slot in listed.items() if owners.get(tag) != slot)
+    if not moved:
+        return
+    print(f"  {len(moved)} tag(s) reassigned by SLOT_OVERRIDES/SLOT_PRIORITY:", flush=True)
+    for tag in moved:
+        print(f"    {tag} -> {owners.get(tag)}", flush=True)
+
+
 def collect_tag_pools(min_posts: int, tags_csv: Path | None = None) -> dict[str, list[str]]:
     sections = parse_sections(fetch_wiki_body(WIKI_TITLE))
 
@@ -267,7 +386,7 @@ def collect_tag_pools(min_posts: int, tags_csv: Path | None = None) -> dict[str,
     else:
         counts = fetch_post_counts(min_posts)
 
-    cleaned: dict[str, list[str]] = {}
+    candidates: dict[str, list[str]] = {}
     for slot in SLOT_ORDER:
         excluded = SLOT_EXCLUDE.get(slot, frozenset())
         unique: dict[str, None] = {}
@@ -280,9 +399,33 @@ def collect_tag_pools(min_posts: int, tags_csv: Path | None = None) -> dict[str,
             if counts and counts.get(tag, 0) < min_posts:
                 continue
             unique[tag] = None
-        cleaned[slot] = sorted(unique)
+        candidates[slot] = sorted(unique)
 
+    owners = assign_slot_owners(candidates)
+    report_slot_moves(candidates, owners)
+
+    cleaned = pools_from_owners(owners)
     cleaned[VOCABULARY_KEY] = pools[VOCABULARY_KEY]
+    return cleaned
+
+
+def reassign_bundled_data(path: Path) -> dict[str, list[str]]:
+    """Re-apply the slot assignment to an existing file, without touching the wiki.
+
+    Useful when only ``SLOT_OVERRIDES`` changed and the Danbooru API is not
+    reachable: the slots hold the pools a refresh already filtered, so running the
+    assignment over them gives the same result as a full refresh of that same wiki
+    snapshot.
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    candidates = {slot: [tag for tag in data.get(slot, ()) if isinstance(tag, str)] for slot in SLOT_ORDER}
+
+    owners = assign_slot_owners(candidates)
+    report_slot_moves(candidates, owners)
+
+    cleaned = pools_from_owners(owners)
+    vocabulary = data.get(VOCABULARY_KEY) or []
+    cleaned[VOCABULARY_KEY] = sorted({tag for tag in vocabulary if isinstance(tag, str)})
     return cleaned
 
 
@@ -297,13 +440,21 @@ def main() -> None:
     parser.add_argument("--tags-csv", type=Path, help="Read post counts from a local danbooru.csv instead of the API.")
     parser.add_argument("--dry-run", action="store_true", help="Print the resulting pools without writing the file.")
     parser.add_argument("--no-cache", action="store_true", help="Ignore the local HTTP response cache in the temp dir.")
+    parser.add_argument(
+        "--reassign",
+        type=Path,
+        help="Re-apply the slot assignment to an existing data file instead of fetching the wiki.",
+    )
     args = parser.parse_args()
 
     if args.no_cache:
         global CACHE_ENABLED
         CACHE_ENABLED = False
 
-    pools = collect_tag_pools(args.min_posts, args.tags_csv)
+    if args.reassign:
+        pools = reassign_bundled_data(args.reassign)
+    else:
+        pools = collect_tag_pools(args.min_posts, args.tags_csv)
 
     total = sum(len(pools[slot]) for slot in SLOT_ORDER)
     for slot in SLOT_ORDER:

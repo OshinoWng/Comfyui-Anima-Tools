@@ -795,6 +795,26 @@ class AnimaPromptComposer:
         )
     )
 
+    # Every input that feeds the resolved prompt.  The queue hook can only draw a
+    # prompt while all of them hold a value: a linked input is still
+    # ``[node_id, output_index]`` until execution, see
+    # ``_resolve_anima_prompt_composer_nodes``.
+    QUEUE_RESOLVE_INPUTS = (
+        "enable_artist",
+        "enable_character",
+        "enable_clothing",
+        "enable_background",
+        "enable_pose",
+        "character_detail",
+        "seed",
+        "artist_count",
+        "character_seed",
+        "character_tag_count",
+        "character_keep_features",
+        "clothing_seed",
+        "clothing_source",
+    )
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -809,9 +829,18 @@ class AnimaPromptComposer:
                 "artist_count": ("INT", {"default": 1, "min": 0, "max": 20}),
                 "preview_collapsed": ("BOOLEAN", {"default": False}),
                 "resolved_prompt": ("STRING", {"multiline": True, "default": ""}),
-                # New widgets are always appended so that widgets_values indices of
-                # already saved workflows keep pointing at the same fields.  Keep
-                # this order in sync with _workflow_widget_index().
+            },
+            # The 3.3.0 widgets are appended *here* rather than kept in `required`:
+            # ComfyUI answers a required input that is absent from a prompt with
+            # `required_input_missing`, and Python argument defaults do not bypass
+            # that check, so an API prompt saved with 3.2.9 would stop validating.
+            # A missing optional input is skipped by validation and filled in by
+            # the `compose_prompt` signature at execution time.  The frontend reads
+            # both dicts in order (required first, then optional), and every new
+            # name is appended to the end of its dict, so the widget order - and
+            # with it the `widgets_values` layout of saved workflows - is
+            # unchanged.  Keep this order in sync with _workflow_widget_index().
+            "optional": {
                 "character_seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
                 "character_tag_count": ("INT", {"default": 3, "min": 0, "max": 30}),
                 "character_keep_features": ("BOOLEAN", {"default": True}),
@@ -1854,6 +1883,60 @@ def _resolve_anima_prompt_plus_clip_nodes(prompt, extra_pnginfo, prompt_plus):
         }
     return updates
 
+def _resolve_anima_prompt_composer_nodes(prompt, extra_pnginfo, composer):
+    """Draw the random prompt of every ``AnimaPromptComposer`` before the queue.
+
+    Resolving here is what keeps the ``resolved_prompt`` widget, the node preview
+    and the prompt that finally runs in sync while ``seed`` is ``-1``, because
+    ``compose_prompt`` reuses the text this hook stored.
+
+    That only holds while every relevant input already has a value.  A linked
+    input is still ``[node_id, output_index]`` at this point, so resolving anyway
+    would persist a prompt built from the widget defaults - a fixed
+    ``character_seed`` of 4242 would be read as ``-1`` and the character would
+    keep changing - and ``compose_prompt`` would then reuse that stale text
+    instead of the value that was evaluated.  Such nodes are deferred to
+    execution, and any text persisted by an earlier run is dropped so that it
+    cannot be reused either.
+    """
+    if not isinstance(prompt, dict):
+        return
+
+    for node_id, node in list(prompt.items()):
+        if not isinstance(node, dict) or node.get("class_type") != "AnimaPromptComposer":
+            continue
+        inputs = node.setdefault("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+
+        if any(isinstance(inputs.get(name), list) for name in composer.QUEUE_RESOLVE_INPUTS):
+            inputs["resolved_prompt"] = ""
+            continue
+
+        selected, resolved_prompt = composer._resolve_prompt_data(
+            enable_artist=inputs.get("enable_artist", True),
+            enable_character=inputs.get("enable_character", True),
+            enable_clothing=inputs.get("enable_clothing", True),
+            enable_background=inputs.get("enable_background", True),
+            enable_pose=inputs.get("enable_pose", True),
+            character_detail=inputs.get("character_detail", "trigger"),
+            seed=inputs.get("seed", -1),
+            artist_count=inputs.get("artist_count", 1),
+            character_seed=inputs.get("character_seed", -1),
+            character_tag_count=inputs.get("character_tag_count", 3),
+            character_keep_features=inputs.get("character_keep_features", True),
+            clothing_seed=inputs.get("clothing_seed", -1),
+            clothing_source=inputs.get("clothing_source", "author"),
+        )
+        inputs["resolved_prompt"] = resolved_prompt
+        composer._record_resolved_prompt(
+            prompt,
+            extra_pnginfo,
+            node_id,
+            resolved_prompt,
+            selected,
+        )
+
 def _install_anima_prompt_composer_queue_resolver():
     if getattr(PromptServer.instance, "_anima_prompt_composer_resolver_installed", False):
         return
@@ -1886,36 +1969,7 @@ def _install_anima_prompt_composer_queue_resolver():
                     json_data.get("client_id"),
                 )
 
-            for node_id, node in list(prompt.items()):
-                if not isinstance(node, dict) or node.get("class_type") != "AnimaPromptComposer":
-                    continue
-                inputs = node.setdefault("inputs", {})
-                if not isinstance(inputs, dict):
-                    continue
-
-                selected, resolved_prompt = composer._resolve_prompt_data(
-                    enable_artist=inputs.get("enable_artist", True),
-                    enable_character=inputs.get("enable_character", True),
-                    enable_clothing=inputs.get("enable_clothing", True),
-                    enable_background=inputs.get("enable_background", True),
-                    enable_pose=inputs.get("enable_pose", True),
-                    character_detail=inputs.get("character_detail", "trigger"),
-                    seed=inputs.get("seed", -1),
-                    artist_count=inputs.get("artist_count", 1),
-                    character_seed=inputs.get("character_seed", -1),
-                    character_tag_count=inputs.get("character_tag_count", 3),
-                    character_keep_features=inputs.get("character_keep_features", True),
-                    clothing_seed=inputs.get("clothing_seed", -1),
-                    clothing_source=inputs.get("clothing_source", "author"),
-                )
-                inputs["resolved_prompt"] = resolved_prompt
-                composer._record_resolved_prompt(
-                    prompt,
-                    extra_pnginfo,
-                    node_id,
-                    resolved_prompt,
-                    selected,
-                )
+            _resolve_anima_prompt_composer_nodes(prompt, extra_pnginfo, composer)
         except Exception as e:
             print(f"[Anima Tools] Failed to resolve random prompt metadata before queue: {e}")
         return json_data

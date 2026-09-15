@@ -159,6 +159,63 @@ class AnimaPromptComposerRandomComboTests(unittest.TestCase):
 
         self.assertEqual(seen_variants, {"top_bottom", "uniform", "traditional"})
 
+    def test_danbooru_outfits_pick_at_most_one_tag_per_pool(self):
+        """No outfit may use a slot twice - the review of 2026-09-14 reported two
+        kinds of footwear, which only a pool that holds footwear can produce."""
+        pools = {slot: set(self.attire[slot]) for slot in self.composer_class.DANBOORU_SLOT_ORDER}
+
+        for seed in range(1, 200):
+            selected = self.selection(
+                character_detail="trigger",
+                seed=seed,
+                clothing_source="danbooru",
+            )
+            titles = [entry["title"] for entry in selected["clothing"]]
+            for slot, tags in pools.items():
+                picked = sorted(tag for tag in titles if tag in tags)
+                self.assertLessEqual(len(picked), 1, f"seed {seed} picked {picked} from {slot}")
+
+    def test_a_main_outfit_is_never_a_layered_garment(self):
+        layered = {
+            tag
+            for slot in ("decoration", "top", "bottom", "socks", "shoes")
+            for tag in self.attire[slot]
+        }
+
+        for seed in range(1, 120):
+            selected = self.selection(
+                character_detail="trigger",
+                seed=seed,
+                clothing_source="danbooru",
+            )
+            for entry in selected["clothing"]:
+                slot = entry["subtitle"].split()[1]
+                if slot in ("uniform", "traditional"):
+                    self.assertNotIn(entry["title"], layered, f"seed {seed} drew {entry['title']} as a {slot}")
+
+    def test_the_reported_clothing_seed_still_draws_one_main_outfit(self):
+        """`clothing_seed=26` produced `geta, frilled thigh strap, socks, pumps`."""
+        selected = self.selection(
+            character_detail="trigger",
+            seed=1,
+            clothing_seed=26,
+            clothing_source="danbooru",
+        )
+        entries = selected["clothing"]
+        titles = [entry["title"] for entry in entries]
+        slots = [entry["subtitle"].split()[1] for entry in entries]
+        mains = [slot for slot in slots if slot in ("top", "bottom", "uniform", "traditional")]
+
+        self.assertTrue(mains, f"clothing_seed=26 picked no main outfit: {titles}")
+        if "top" in slots or "bottom" in slots:
+            self.assertEqual(set(mains), {"top", "bottom"})
+        else:
+            self.assertEqual(len(mains), 1)
+
+        for slot in ("shoes", "socks"):
+            picked = [title for title in titles if title in self.attire[slot]]
+            self.assertLessEqual(len(picked), 1, f"clothing_seed=26: {titles}")
+
     def test_character_tag_clothing_stays_inside_the_attire_vocabulary(self):
         vocabulary = set(self.attire["vocabulary"])
         for seed in range(1, 40):

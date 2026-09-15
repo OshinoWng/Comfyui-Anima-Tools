@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -104,6 +105,99 @@ class DanbooruAttireToolTests(unittest.TestCase):
         # The vocabulary is a superset of every slot.
         for slot in self.tool.SLOT_ORDER:
             self.assertTrue(set(data[slot]).issubset(set(data[self.tool.VOCABULARY_KEY])), slot)
+
+    def test_every_tag_belongs_to_exactly_one_slot(self):
+        data = self.bundled_data()
+        owners = {}
+        for slot in self.tool.SLOT_ORDER:
+            for tag in data[slot]:
+                self.assertNotIn(tag, owners, f"{tag} is listed by {owners.get(tag)} and {slot}")
+                owners[tag] = slot
+
+    def test_main_outfit_slots_do_not_hold_layered_garments(self):
+        """A `uniform`/`traditional` entry is drawn as a whole outfit.
+
+        The review of 2026-09-14 found `geta`, `tabi`, `hood` and `cape` in those
+        slots, so the node produced outfits without a main garment - and, for
+        `geta`, a second kind of footwear from the `shoes` layer.
+        """
+        data = self.bundled_data()
+        layered = {
+            tag
+            for slot in ("decoration", "top", "bottom", "socks", "shoes")
+            for tag in data[slot]
+        }
+        main_tags = set(data["uniform"]) | set(data["traditional"])
+
+        self.assertEqual(sorted(main_tags & layered), [])
+
+    def test_the_reported_tags_moved_to_the_slot_that_owns_them(self):
+        data = self.bundled_data()
+
+        for tag in ("geta", "tabi"):
+            self.assertNotIn(tag, data["traditional"], tag)
+        self.assertIn("geta", data["shoes"])
+        self.assertIn("tabi", data["socks"])
+
+        for tag in ("hood", "cape", "capelet", "side cape"):
+            self.assertNotIn(tag, data["uniform"], tag)
+            self.assertIn(tag, data["decoration"], tag)
+
+        for tag in ("buruma", "tutu", "fundoshi", "hakama", "kimono skirt", "loincloth", "sweatpants"):
+            self.assertNotIn(tag, data["uniform"], tag)
+
+        for tag in ("haori", "happi", "hanten (clothes)", "mizu happi"):
+            self.assertNotIn(tag, data["traditional"], tag)
+            self.assertIn(tag, data["top"], tag)
+
+        for tag in ("sarashi", "chest sarashi", "tasuki", "sash", "stole"):
+            self.assertNotIn(tag, data["traditional"], tag)
+            self.assertIn(tag, data["decoration"], tag)
+
+        # Listed by two main-outfit sections; `uniform` owns it.
+        self.assertIn("miko", data["uniform"])
+        self.assertNotIn("miko", data["traditional"])
+
+    def test_assign_slot_owners_prefers_the_override(self):
+        owners = self.tool.assign_slot_owners(
+            {"uniform": ["hood", "school uniform"], "decoration": ["hood"]}
+        )
+
+        self.assertEqual(owners, {"hood": "decoration", "school uniform": "uniform"})
+
+    def test_assign_slot_owners_settles_the_rest_by_priority(self):
+        owners = self.tool.assign_slot_owners({"uniform": ["mystery outfit"], "socks": ["mystery outfit"]})
+
+        self.assertEqual(owners, {"mystery outfit": "socks"})
+        self.assertLess(self.tool.SLOT_PRIORITY.index("socks"), self.tool.SLOT_PRIORITY.index("uniform"))
+
+    def test_overrides_and_priority_only_name_known_slots(self):
+        self.assertEqual(set(self.tool.SLOT_PRIORITY), set(self.tool.SLOT_ORDER))
+        self.assertEqual(len(set(self.tool.SLOT_PRIORITY)), len(self.tool.SLOT_PRIORITY))
+        for tag, slot in self.tool.SLOT_OVERRIDES.items():
+            self.assertIn(slot, self.tool.SLOT_ORDER, tag)
+            self.assertEqual(self.tool.normalize_tag(tag), tag, tag)
+            self.assertNotIn(tag, self.tool.TAG_BLOCKLIST, tag)
+
+    def test_assign_slot_owners_rejects_an_unknown_slot(self):
+        original = self.tool.SLOT_OVERRIDES
+        self.tool.SLOT_OVERRIDES = {**original, "school uniform": "hats"}
+        try:
+            with self.assertRaises(ValueError):
+                self.tool.assign_slot_owners({"uniform": ["school uniform"]})
+        finally:
+            self.tool.SLOT_OVERRIDES = original
+
+    def test_reassigning_the_bundled_file_keeps_it_unchanged(self):
+        bundled = self.bundled_data()
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = Path(tmp) / "danbooru_attire_data.json"
+            copy.write_text(json.dumps(bundled), encoding="utf-8")
+
+            self.assertEqual(self.tool.reassign_bundled_data(copy), bundled)
+
+    def bundled_data(self):
+        return json.loads((REPO_ROOT / "js" / "danbooru_attire_data.json").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
