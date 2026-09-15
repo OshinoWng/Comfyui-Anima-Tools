@@ -2010,10 +2010,19 @@ def _resolve_anima_prompt_composer_nodes(prompt, extra_pnginfo, composer):
     that did not exist when the workflow was saved, see ``sanitize_inputs``) are
     repaired here too: ``validate_inputs`` refuses the prompt otherwise, before the
     node gets a chance to apply its own defaults.
+
+    Returns ``{node_id: selected}`` for the nodes drawn here, which the caller
+    forwards to the client: a node whose inputs are unchanged is answered from
+    ComfyUI's cache and is therefore *not* executed, so its ``ui`` payload - and
+    with it the node preview - would otherwise keep the thumbnails of an earlier
+    draw (change the seed, run, change it back, run: the images stay on the
+    previous seed).  A node that is deferred because one of its inputs is still a
+    link cannot be reported, it announces its own draw when it executes.
     """
     if not isinstance(prompt, dict):
-        return
+        return {}
 
+    updates = {}
     for node_id, node in list(prompt.items()):
         if not isinstance(node, dict) or node.get("class_type") != "AnimaPromptComposer":
             continue
@@ -2050,6 +2059,9 @@ def _resolve_anima_prompt_composer_nodes(prompt, extra_pnginfo, composer):
             resolved_prompt,
             selected,
         )
+        updates[node_id] = selected
+
+    return updates
 
 def _install_anima_prompt_composer_queue_resolver():
     if getattr(PromptServer.instance, "_anima_prompt_composer_resolver_installed", False):
@@ -2083,7 +2095,15 @@ def _install_anima_prompt_composer_queue_resolver():
                     json_data.get("client_id"),
                 )
 
-            _resolve_anima_prompt_composer_nodes(prompt, extra_pnginfo, composer)
+            composer_updates = _resolve_anima_prompt_composer_nodes(prompt, extra_pnginfo, composer)
+            if composer_updates:
+                # Keeps the node preview in sync with the run that is about to
+                # happen, including when the node itself is served from the cache.
+                PromptServer.instance.send_sync(
+                    "anima.prompt_composer_selection",
+                    {"nodes": composer_updates},
+                    json_data.get("client_id"),
+                )
         except Exception as e:
             print(f"[Anima Tools] Failed to resolve random prompt metadata before queue: {e}")
         return json_data
