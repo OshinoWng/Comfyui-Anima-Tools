@@ -1333,7 +1333,8 @@ class AnimaPromptComposer:
         at that index, so a slot that already holds something of another kind is
         left untouched instead of being overwritten - that is how a drawn prompt
         ended up in a boolean slot and how a stale index turned every later widget
-        of the node into a ``null``.
+        of the node into a ``null``.  An empty slot (``null``, what the frontend
+        writes for a widget it has no value for) belongs to nobody and is used.
         """
         if not isinstance(workflow_node, dict):
             return
@@ -1342,7 +1343,8 @@ class AnimaPromptComposer:
             index = self._workflow_widget_index(widget_name)
             if index < 0:
                 return
-            if index < len(widgets_values) and not isinstance(widgets_values[index], type(value)):
+            current = widgets_values[index] if index < len(widgets_values) else None
+            if current is not None and not isinstance(current, type(value)):
                 return
             while len(widgets_values) <= index:
                 widgets_values.append("")
@@ -1464,7 +1466,7 @@ class AnimaPromptComposer:
 
     @classmethod
     def sanitize_inputs(cls, inputs):
-        """Replace input values that ``validate_inputs`` cannot convert with defaults.
+        """Replace input values that ``validate_inputs`` cannot accept with usable ones.
 
         The frontend stores a widget it has no value for as ``null`` (its widget
         serialization writes ``value ?? null``) and restores a saved
@@ -1480,8 +1482,15 @@ class AnimaPromptComposer:
         Nothing inside the node can catch that, so the value is repaired on the
         queue hook instead (``_resolve_anima_prompt_composer_nodes``).  Links
         (``[node_id, output_index]``) are left alone - they are resolved after
-        execution - and so is every value the validator already accepts.  Returns
-        the names that were replaced, for logging and tests.
+        execution - and so is every value the validator already accepts.
+
+        A number outside the declared ``min``/``max`` is rejected by the same
+        validation (``value_smaller_than_min`` / ``value_bigger_than_max``, and this
+        node does not take those over with ``VALIDATE_INPUTS``), so it is repaired
+        here too - clamped rather than reset, which keeps the value the widget asked
+        for as far as the engine accepts it.
+
+        Returns the names that were changed, for logging and tests.
         """
         if not isinstance(inputs, dict):
             return []
@@ -1494,13 +1503,17 @@ class AnimaPromptComposer:
                 value = inputs[name]
                 if isinstance(value, list):  # a link, resolved at execution
                     continue
-                if cls._input_value_survives_validation(spec, value):
+                if not cls._input_value_survives_validation(spec, value):
+                    default = spec[1].get("default")
+                    if default is None:
+                        continue  # nothing to fall back to; leave it to ComfyUI
+                    inputs[name] = default
+                    replaced.append(name)
                     continue
-                default = spec[1].get("default")
-                if default is None:
-                    continue  # nothing to fall back to; leave it to ComfyUI
-                inputs[name] = default
-                replaced.append(name)
+                clamped = cls._clamped_value(spec, value)
+                if clamped is not None and clamped != value:
+                    inputs[name] = clamped
+                    replaced.append(name)
         return replaced
 
     @staticmethod
@@ -1524,6 +1537,34 @@ class AnimaPromptComposer:
             return True
         # str() and bool() accept anything, and no other type is converted.
         return True
+
+    @staticmethod
+    def _clamped_value(spec, value):
+        """Return ``value`` limited to the range ``validate_inputs`` accepts.
+
+        ``None`` means there is nothing to clamp: no ``min``/``max`` is declared, the
+        value is not a number, or it is already inside the range.  The engine converts
+        a literal and *then* compares it with the declared range, so an out-of-range
+        widget rejects the prompt exactly like an unconvertible one
+        (``value_bigger_than_max`` / ``value_smaller_than_min``).
+        """
+        options = spec[1] if isinstance(spec[1], dict) else {}
+        lower = options.get("min")
+        upper = options.get("max")
+        if lower is None and upper is None:
+            return None
+        declared = spec[0]
+        if isinstance(declared, (list, tuple)) or declared not in ("INT", "FLOAT"):
+            return None
+        try:
+            number = int(value) if declared == "INT" else float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None  # not convertible; the caller falls back to the default
+        if lower is not None and number < lower:
+            return lower
+        if upper is not None and number > upper:
+            return upper
+        return None
 
     def _resolve_prompt_data(
         self,
@@ -2002,7 +2043,7 @@ def _resolve_anima_prompt_composer_nodes(prompt, extra_pnginfo, composer):
     would persist a prompt built from the widget defaults - a fixed
     ``character_seed`` of 4242 would be read as ``-1`` and the character would
     keep changing - and ``compose_prompt`` would then reuse that stale text
-    instead of the value that was evaluated.      Such nodes are deferred to
+    instead of the value that was evaluated.  Such nodes are deferred to
     execution, and any text persisted by an earlier run is dropped so that it
     cannot be reused either.
 

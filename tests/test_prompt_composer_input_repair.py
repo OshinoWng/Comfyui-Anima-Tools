@@ -85,7 +85,14 @@ def load_composer_namespace():
 
 
 def conversion_errors(input_types, inputs):
-    """Port of the conversion block in ``validate_inputs``: what raises is an error."""
+    """Port of the rules in ``validate_inputs`` that stop a prompt: what raises is one.
+
+    Two are mirrored, in the order the engine applies them: the literal conversions
+    (``int()`` / ``float()`` / ``str()`` / ``bool()``) and the declared range
+    (``value_smaller_than_min`` / ``value_bigger_than_max``), which this node does
+    not take over with ``VALIDATE_INPUTS``.  Combo membership comes last, as it does
+    there.
+    """
     errors = []
     for category in ("required", "optional"):
         for name, spec in input_types.get(category, {}).items():
@@ -95,18 +102,24 @@ def conversion_errors(input_types, inputs):
             if isinstance(value, list):  # a link, resolved after execution
                 continue
             declared = spec[0]
+            options = spec[1] if isinstance(spec[1], dict) else {}
             try:
-                if isinstance(declared, (list, tuple)):
-                    if value not in declared:
-                        raise ValueError(f"{value!r} not in {declared!r}")
-                elif declared == "INT":
-                    int(value)
-                elif declared == "FLOAT":
-                    float(value)
-                elif declared == "STRING":
-                    str(value)
-                elif declared == "BOOLEAN":
-                    bool(value)
+                combo = declared if isinstance(declared, (list, tuple)) else None
+                if combo is None:
+                    if declared == "INT":
+                        value = int(value)
+                    elif declared == "FLOAT":
+                        value = float(value)
+                    elif declared == "STRING":
+                        value = str(value)
+                    elif declared == "BOOLEAN":
+                        value = bool(value)
+                    if "min" in options and value < options["min"]:
+                        raise ValueError(f"value_smaller_than_min {value}")
+                    if "max" in options and value > options["max"]:
+                        raise ValueError(f"value_bigger_than_max {value}")
+                elif value not in combo:
+                    raise ValueError(f"{value!r} not in {combo!r}")
             except Exception as ex:
                 errors.append((name, str(ex)))
     return errors
@@ -206,6 +219,71 @@ class AnimaPromptComposerInputRepairTests(unittest.TestCase):
         self.assertEqual(self.composer.sanitize_inputs(payload), [])
         self.assertEqual(payload, expected)
 
+    # --- values the validator rejects for being out of range ----------------
+
+    def test_the_range_rule_is_mirrored_by_the_port(self):
+        """Without this the clamp tests would pass against a validator that rejects nothing."""
+        self.assertEqual(
+            [name for name, _ in conversion_errors(self.input_types, self.payload(character_tag_count=31))],
+            ["character_tag_count"],
+        )
+        self.assertEqual(
+            [name for name, _ in conversion_errors(self.input_types, self.payload(artist_count=-1))],
+            ["artist_count"],
+        )
+        self.assertEqual(
+            conversion_errors(self.input_types, self.payload(character_tag_count=30, artist_count=20)),
+            [],
+        )
+
+    def test_a_value_above_the_declared_max_is_clamped(self):
+        payload = self.payload(artist_count=21, character_tag_count=99)
+
+        replaced = self.composer.sanitize_inputs(payload)
+
+        self.assertEqual(replaced, ["artist_count", "character_tag_count"])
+        self.assertEqual(payload["artist_count"], 20)
+        self.assertEqual(payload["character_tag_count"], 30)
+        self.assertEqual(conversion_errors(self.input_types, payload), [])
+
+    def test_a_value_below_the_declared_min_is_clamped(self):
+        payload = self.payload(seed=-5, artist_count=-3)
+
+        replaced = self.composer.sanitize_inputs(payload)
+
+        self.assertEqual(replaced, ["seed", "artist_count"])
+        self.assertEqual(payload["seed"], -1)
+        self.assertEqual(payload["artist_count"], 0)
+        self.assertEqual(conversion_errors(self.input_types, payload), [])
+
+    def test_values_inside_the_range_are_left_alone(self):
+        payload = self.payload(seed=2147483647, artist_count=20, character_tag_count=0, character_seed=-1)
+
+        self.assertEqual(self.composer.sanitize_inputs(payload), [])
+        self.assertEqual(payload["seed"], 2147483647)
+        self.assertEqual(payload["artist_count"], 20)
+
+    def test_the_queue_hook_clamps_an_out_of_range_widget(self):
+        inputs = self.payload(seed=150, character_tag_count=99)
+        prompt = {"714": {"class_type": "AnimaPromptComposer", "inputs": inputs}}
+
+        self.resolve_queue(prompt, {"workflow": {"nodes": []}}, self.composer)
+
+        self.assertEqual(inputs["character_tag_count"], 30)
+        self.assertEqual(conversion_errors(self.input_types, inputs), [])
+
+    def test_the_clamp_helper_covers_the_paths_no_widget_reaches(self):
+        """This node declares no ``FLOAT`` input, so its branch needs a direct test."""
+        clamp = self.composer_class._clamped_value
+        ranged_float = ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0})
+
+        self.assertIsNone(clamp(ranged_float, 0.25))
+        self.assertEqual(clamp(ranged_float, 1.5), 1.0)
+        self.assertEqual(clamp(ranged_float, -2.0), 0.0)
+        self.assertIsNone(clamp(("INT", {"default": 1}), 999), "no range declared")
+        self.assertIsNone(clamp(("INT", {"default": 1, "min": 0, "max": 10}), "abc"), "not a number")
+        self.assertIsNone(clamp(("STRING", {"default": "", "min": 0, "max": 10}), "abc"))
+
     def test_a_combo_value_that_is_not_listed_falls_back_to_the_default(self):
         payload = self.payload(character_detail="bogus", clothing_source="bogus")
 
@@ -252,6 +330,25 @@ class AnimaPromptComposerInputRepairTests(unittest.TestCase):
         index = self.composer._workflow_widget_index("resolved_prompt")
         self.assertEqual(len(workflow_node["widgets_values"]), index + 1)
         self.assertEqual(workflow_node["widgets_values"][index], "drawn, ")
+
+    def test_an_empty_slot_can_be_used(self):
+        # `null` is what the frontend writes for a widget it has no value for, which
+        # is what an untouched `resolved_prompt` slot looks like in a workflow saved
+        # by an older layout.
+        workflow_node = {"widgets_values": [False] * 10 + [None]}
+
+        self.composer._set_workflow_widget_value(workflow_node, "resolved_prompt", "drawn, ")
+
+        self.assertEqual(workflow_node["widgets_values"][10], "drawn, ")
+
+    def test_a_slot_holding_another_kind_of_value_is_still_left_alone(self):
+        for occupant in (False, 0, ["1"], {"value": 1}):
+            with self.subTest(occupant=occupant):
+                workflow_node = {"widgets_values": [False] * 10 + [occupant]}
+
+                self.composer._set_workflow_widget_value(workflow_node, "resolved_prompt", "drawn, ")
+
+                self.assertEqual(workflow_node["widgets_values"][10], occupant)
 
     def test_a_dict_layout_is_written_by_name(self):
         workflow_node = {"widgets_values": {"resolved_prompt": "old"}}
