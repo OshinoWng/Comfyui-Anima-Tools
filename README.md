@@ -229,10 +229,10 @@ LoRA loading and downloading require `.safetensors` files within directories reg
 *   `tag_meta` (Boolean): 默认关闭。meta 基本是上传元信息（`highres`、`character_request` 等），放进提示词没有好处。
 *   `block_tags` / `use_default_blocklist` (String / Boolean): 默认屏蔽 `artist_name`、`character_request`、`commentary_request`、`bad_id`、`watermark`、`english_text` 等「描述上传」而非「描述画面」的标签；可追加自己的屏蔽词，或整体关掉。**每行/每个逗号一个标签**（空格不切分，所以 `black hair` 与 `black_hair` 都表示同一个标签）。
 *   `login` / `api_key` (String): 可选。留空则读环境变量 `DANBOORU_LOGIN` / `DANBOORU_API_KEY`（**不要写进工作流**，也不发给 CDN）。API key 能解锁被审查（censored）标签、读写收藏，但**不会提升标签数量上限**。
-*   `max_attempts` / `timeout` / `cache_dir`: 真随机模式下的重试次数（抽到视频/动图会重抽）、单次请求超时、图片缓存目录（默认 `input/danbooru_cache`）。整次运行另有总预算 `timeout × max_attempts`（默认 60 秒），用尽即报错而不是继续干等；缓存文件名是 `<档位>-<md5>.<ext>`，只保留最新 **500** 个（只清理本节点写的文件）。
+*   `max_attempts` / `timeout` / `cache_dir`: 真随机模式下的重试次数（抽到视频/动图会重抽）、单次请求超时、图片缓存目录（默认 `input/danbooru_cache`）。整次运行另有总预算 `timeout × max_attempts`（默认 60 秒），用尽即报错而不是继续干等；**读超时 / 连接中途断开也算一次网络级失败**，会在剩余尝试与预算内重试（不是一次卡住就整轮失败）。缓存文件名是 `<档位>-<md5>.<ext>`，只保留最新 **500** 个（只清理本节点写的文件）。
 *   输出：`image` (IMAGE)、`artist` / `character` / `copyright` / `general`（分组标签字符串）、`prompt`（按 **画师 → 角色 → 作品 → 其余 → meta** 顺序拼好的整串）、`meta`（JSON：id / rating / score / source / 图片地址 / 是否命中缓存 等）。
 *   只取静态图：`file_ext` 只接受 jpg/jpeg/png/webp/gif，带 `animated` / `video` 标签的帖子直接跳过（**刻意不用 `-animated` 排除**，因为那会占掉一个标签名额）。
-*   网络兜底：本网络下 `danbooru.donmai.us` 会被错误解析（实测拿到 Dropbox 段的地址、请求超时），节点内置了实测可用的 Cloudflare 地址，**仅在正常请求失败时**启用（连接仍按真实域名做 SNI 与证书校验）；也可以把域名交给启动层的 hosts 钉定（`launch/dns.py`，3.1.1 起启动即钉）。⚠️ **第一次请求仍会白等一个 `timeout`**（DNS 投毒：解析成功但连不上），之后同一进程会记住该域名的兜底路线，不再重复等待（若该兜底地址被站点 **403/429** 拦下，节点会自动交回正常解析再试一次，避免一个被挑战的地址把域名永久钉死）；想连第一次也省掉，就把 `timeout` 调到 `6~10`，或让启动层先钉 hosts。
+*   网络兜底：本网络下 `danbooru.donmai.us` 会被错误解析（实测拿到 Dropbox 段的地址、请求超时），节点内置了实测可用的 Cloudflare 地址，**仅在正常请求失败时**启用（连接仍按真实域名做 SNI 与证书校验）；也可以把域名交给启动层的 hosts 钉定（`launch/dns.py`，3.1.1 起启动即钉）。**读超时（连上了但响应体不再往外送）同样算连接级失败**，一样会去试内置 IP，并在报错里说明「多少秒内没读完、把 timeout 调大」，不再抛裸的 `The read operation timed out`。⚠️ **第一次请求仍会白等一个 `timeout`**（DNS 投毒：解析成功但连不上），之后同一进程会记住该域名的兜底路线，不再重复等待（若该兜底地址被站点 **403/429** 拦下，节点会自动交回正常解析再试一次，避免一个被挑战的地址把域名永久钉死）；想连第一次也省掉，就把 `timeout` 调到 `6~10`，或让启动层先钉 hosts。
 *   零第三方依赖：请求只用标准库，Pillow / torch 仅在 ComfyUI 运行时用于解码。
 
 > [!NOTE]

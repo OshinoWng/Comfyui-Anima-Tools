@@ -711,6 +711,94 @@ class DanbooruNamespaceTests(unittest.TestCase):
             "a block aimed at the pinned address hands the host back to DNS",
         )
 
+    # --- timeouts (the connection lives, the body stalls) -------------------
+
+    def test_a_read_timeout_counts_as_a_connection_failure(self):
+        """``response.read()`` timeouts arrive raw - urllib never wraps them."""
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+            def read(self):
+                raise TimeoutError("The read operation timed out")
+
+        original = urllib.request.urlopen
+        urllib.request.urlopen = lambda request, timeout=None: Response()
+        self.addCleanup(setattr, urllib.request, "urlopen", original)
+
+        with self.assertRaises(urllib.error.URLError):
+            self.ns["_plain_get"]("https://danbooru.donmai.us/posts.json?tags=rating%3Ageneral")
+
+    def test_a_bare_timeout_falls_back_to_the_pinned_ips(self):
+        asked = []
+
+        def plain(url, timeout=None, headers=None):
+            asked.append("plain")
+            raise TimeoutError("The read operation timed out")
+
+        def pinned(url, timeout=None, headers=None):
+            asked.append("pinned")
+            return b"PINNED"
+
+        self.ns["_plain_get"] = plain
+        self.ns["_pinned_get"] = pinned
+
+        self.assertEqual(self.ns["http_get"]("https://danbooru.donmai.us/posts.json"), b"PINNED")
+        self.assertEqual(asked, ["plain", "pinned"])
+
+    def test_a_timed_out_search_is_retried_before_failing(self):
+        rounds = []
+
+        def plain(url, timeout=None, headers=None):
+            if "posts.json" in url:
+                rounds.append(url)
+                if len(rounds) == 1:
+                    raise TimeoutError("The read operation timed out")
+                return json.dumps([sample_post()]).encode("utf-8")
+            return b"IMAGEBYTES"
+
+        def pinned(url, timeout=None, headers=None):
+            raise self.ns["DanbooruError"]("内置 IP 全部不可达：timed out", status=None)
+
+        self.ns["_plain_get"] = plain
+        self.ns["_pinned_get"] = pinned
+        self.ns["load_image_tensor"] = lambda data: ("tensor", data)
+        with tempfile.TemporaryDirectory() as cache_dir:
+            result = self.node.fetch_random_post(
+                query_tags="rating:general", max_attempts=2, cache_dir=cache_dir
+            )
+
+        self.assertEqual(len(rounds), 2, "a dropped connection is worth another round")
+        self.assertEqual(json.loads(result[6])["attempts"], 2)
+        self.assertEqual(result[0], ("tensor", b"IMAGEBYTES"))
+
+    def test_a_slow_network_reports_the_timeout_in_words(self):
+        calls = []
+
+        def plain(url, timeout=None, headers=None):
+            calls.append(url)
+            raise urllib.error.URLError(TimeoutError("The read operation timed out"))
+
+        def pinned(url, timeout=None, headers=None):
+            raise self.ns["DanbooruError"]("内置 IP 全部不可达：timed out", status=None)
+
+        self.ns["_plain_get"] = plain
+        self.ns["_pinned_get"] = pinned
+        with tempfile.TemporaryDirectory() as cache_dir:
+            with self.assertRaises(RuntimeError) as caught:
+                self.node.fetch_random_post(
+                    query_tags="rating:general", max_attempts=2, cache_dir=cache_dir
+                )
+
+        message = str(caught.exception)
+        self.assertIn("超时", message)
+        self.assertIn("timeout", message, "the hint has to name the widget to turn up")
+        self.assertEqual(len(calls), 2, "both attempts must be spent before giving up")
+
     def test_a_dead_remembered_route_is_not_asked_twice(self):
         self.ns["_plain_get"] = lambda url, timeout=None, headers=None: (
             _ for _ in ()

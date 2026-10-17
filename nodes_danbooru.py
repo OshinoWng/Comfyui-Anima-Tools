@@ -156,11 +156,14 @@ class DanbooruError(RuntimeError):
     ``status`` is the HTTP status when the site answered at all, so callers can
     tell "this query is invalid" (4xx - asking again will not help) apart from
     "the server had a bad moment" (5xx - a shallower page or another try might).
+    ``transient`` marks a failure that says nothing about the query (a timeout,
+    a dropped connection): asking again is worth one of the attempts.
     """
 
-    def __init__(self, message, status=None):
+    def __init__(self, message, status=None, transient=False):
         super(DanbooruError, self).__init__(message)
         self.status = status
+        self.transient = transient
 
 
 # --- tags --------------------------------------------------------------------
@@ -542,6 +545,14 @@ def _plain_get(url, timeout=DEFAULT_TIMEOUT, headers=None):
         raise DanbooruError(
             _http_error_message(error, body), status=getattr(error, "code", None)
         ) from error
+    except urllib.error.URLError:
+        raise
+    except (OSError, http.client.HTTPException) as error:
+        # A read timeout and a connection dropped mid-body both happen *after*
+        # urlopen has returned, so urllib never wraps them.  Passing them on raw
+        # was what showed ComfyUI "The read operation timed out": no pinned-IP
+        # fallback, no retry, no readable hint.  They are connection failures.
+        raise urllib.error.URLError(error) from error
 
 
 def _pinned_get(url, timeout=DEFAULT_TIMEOUT, headers=None):
@@ -584,7 +595,9 @@ def _pinned_get(url, timeout=DEFAULT_TIMEOUT, headers=None):
     # answering, and the caller retries a shallower page on it.  Dropping it
     # turned that retry into a fake "the network is down".
     raise DanbooruError(
-        "内置 IP 全部不可达（%s）：%s" % (host, last_error), status=site_status
+        "内置 IP 全部不可达（%s）：%s" % (host, last_error),
+        status=site_status,
+        transient=site_status is None,
     )
 
 
@@ -595,7 +608,21 @@ def _pinned_get(url, timeout=DEFAULT_TIMEOUT, headers=None):
 PIN_RETRY_STATUSES = (403, 429)
 
 
-def _unreachable_message(host, plain_error, pinned_error):
+def _is_timeout(error):
+    """A timeout hides one level down: ``urlopen`` wraps it in ``URLError``."""
+
+    if isinstance(error, (TimeoutError, socket.timeout)):
+        return True
+    return isinstance(getattr(error, "reason", None), (TimeoutError, socket.timeout))
+
+
+def _unreachable_message(host, plain_error, pinned_error, timeout=DEFAULT_TIMEOUT):
+    if _is_timeout(plain_error):
+        return (
+            "Danbooru 请求超时：%.0f 秒内没有读完 %s 的响应（网络受限或站点繁忙）。"
+            "把节点的 timeout 调大（如 60 秒）、减少 query_tags，或稍后重试。"
+            % (float(timeout or DEFAULT_TIMEOUT), host)
+        )
     return (
         "%s 无法访问：正常解析失败（%s），内置 IP 兜底也失败（%s）。"
         "若一直如此，把域名加进启动层的 hosts 钉定（launch/dns.py）。"
@@ -607,12 +634,13 @@ def http_get(url, timeout=DEFAULT_TIMEOUT, headers=None):
     """One place for every request, and the only seam the tests replace.
 
     A real HTTP status is final - it is the site's answer, not a broken DNS - so
-    only a connection-level ``URLError`` falls through to the pinned addresses.
-    Once a host has *needed* those pins it is remembered for the rest of the
-    process: with a poisoned DNS every request would otherwise pay the full
-    ``timeout`` again before getting anywhere (there is one search per run).
-    A 403/429 on that remembered route is the one exception: such a block can be
-    aimed at a single address, so DNS gets one more chance before it is raised.
+    only a connection-level failure (``URLError``; after ``_plain_get`` also a
+    read timeout) falls through to the pinned addresses.  Once a host has *needed*
+    those pins it is remembered for the rest of the process: with a poisoned DNS
+    every request would otherwise pay the full ``timeout`` again before getting
+    anywhere (there is one search per run).  A 403/429 on that remembered route is
+    the one exception: such a block can be aimed at a single address, so DNS gets
+    one more chance before it is raised.
     """
 
     host = urllib.parse.urlsplit(url).hostname or ""
@@ -629,19 +657,20 @@ def http_get(url, timeout=DEFAULT_TIMEOUT, headers=None):
                 _PINNED_GOOD.discard(host)
                 try:
                     return _plain_get(url, timeout=timeout, headers=headers)
-                except urllib.error.URLError:
+                except (urllib.error.URLError, OSError):
                     raise error
             else:
                 raise  # the site answered (422 and friends): another route cannot help
 
     try:
         data = _plain_get(url, timeout=timeout, headers=headers)
-    except urllib.error.URLError as plain_error:
+    except (urllib.error.URLError, OSError) as plain_error:
         if failed_pin is not None:
             # The pins were just tried and failed; asking them a second time would
             # only burn another timeout before reporting the same thing.
             raise DanbooruError(
-                _unreachable_message(host, plain_error, failed_pin)
+                _unreachable_message(host, plain_error, failed_pin, timeout),
+                transient=True,
             ) from failed_pin
         try:
             data = _pinned_get(url, timeout=timeout, headers=headers)
@@ -649,7 +678,8 @@ def http_get(url, timeout=DEFAULT_TIMEOUT, headers=None):
             if pinned_error.status is not None:
                 raise  # the site answered through the pins too
             raise DanbooruError(
-                _unreachable_message(host, plain_error, pinned_error)
+                _unreachable_message(host, plain_error, pinned_error, timeout),
+                transient=True,
             ) from pinned_error
         _PINNED_GOOD.add(host)
     return data
@@ -871,6 +901,11 @@ class AnimaDanbooruRandomImage:
                     round_request, timeout=min(timeout, remaining), headers=headers
                 )
             except DanbooruError as error:
+                # A timeout or a dropped connection says nothing about the query,
+                # so it is worth another round while the budget lasts - otherwise a
+                # single stalled read (20 s by default) killed the whole run.
+                if getattr(error, "transient", False) and attempts < max_rounds:
+                    continue
                 # A 5xx on a deep page is usually "the database timed out"; the
                 # same query on a shallower page can still answer.  A 4xx (tag
                 # limit, auth) will not change, so it is raised as is.
