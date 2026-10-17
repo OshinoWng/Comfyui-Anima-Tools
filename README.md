@@ -113,11 +113,17 @@ LoRA loading and downloading require `.safetensors` files within directories reg
 *   **角色与服装种子可分离：** 主 `seed` 之外可单独设置角色种子与服装种子，锁定其中一项、另一项继续重抽。
 *   **节点内可折叠预览：** 节点上直接显示随机结果的文字提示词与 3:4 图片预览，并支持折叠隐藏预览区域。
 
-### ⚙️ 6. 智能 Python 后端拼接 (Selector Plus Nodes)
+### 🎲 6. 随机 Danbooru 图 + 标签 (Anima Danbooru Random Image)
+*   **出图与标签成对输出：** 从 Danbooru 按 `query_tags` 随机抽一张**静态**图，同时把它自己的标签按 Anima 写法分组输出（下划线转空格、小写、去重、英文逗号 + 空格连接、画师加 `@` 前缀），出图与提示词一次拿齐，直接喂 `CLIPTextEncode`。
+*   **可复现随机：** `seed = -1` 每次运行重新抽；给定固定 seed 时由「页码 + 页内序号」推导，同一 seed 稳定复现，且**不占用查询标签名额**。
+*   **守标签限额与抓取礼仪：** 默认 `rating:general`（`rating:*` 不计入标签数）、默认屏蔽 `artist_name` / `watermark` 等上传噪声标签、默认取 `sample` 档；动图与非静态帖改由客户端筛掉重试，**不用会占名额的 `-animated`**。
+*   **本地缓存与网络兜底：** 图片按「档位 + md5」落到 `input/danbooru_cache` 复用（换 `size` 不会拿旧档顶替，缓存超过 500 个只清自己写的旧文件）；请求只用标准库（守 `dependencies = []`），DNS 被污染时用内置 Cloudflare 地址兜底（仅在正常请求失败时启用）。
+
+### ⚙️ 7. 智能 Python 后端拼接 (Selector Plus Nodes)
 *   **双版本节点组合：** 提供基础版 (Selector) 与 Plus 版 (Selector+)。
 *   **智能防冲突拼接：** Plus 节点支持自定义 `extra_text`（额外文本）与 `separator`（分隔符）。当两段文本拼合时，系统会自动进行去污与去重，**避免产生双逗号或首尾多余空格**的排版问题，保证工作流稳定。
 
-### 🌐 7. 原生多语言跟随 (Native i18n)
+### 🌐 8. 原生多语言跟随 (Native i18n)
 *   支持中英双语，自动识别并实时跟随 ComfyUI 原生的多语言设置（`Comfy.Locale`），无需手动配置。
 
 ---
@@ -210,6 +216,27 @@ LoRA loading and downloading require `.safetensors` files within directories reg
 *   `model`: ComfyUI 标准模型输入。
 *   `lora_list_json` (String): 前端 LoRA 选择器维护的 LoRA 列表，包含文件名、启用状态与模型强度。
 *   前端面板支持本地 LoRA 预览、Civitai 搜索、下载进度、收藏、持久缩略图缓存与快速二次打开。
+
+### 6. 🎲 Anima Danbooru Random Image (随机 Danbooru 图 + 标签)
+
+从 Danbooru 随机抽一张图，并把它的标签按 Anima 的写法分组输出（`_` 转空格、小写、去重、英文逗号 + 空格连接、画师加 `@` 前缀），既能喂给 `CLIPTextEncode` 当提示词灵感，也能当参考图。
+
+*   `query_tags` (String): 查询标签，默认 `rating:general`。空格或逗号都能分隔；**匿名与免费账号最多 2 个标签**，其中 `rating:*` 不占名额，而 `random:1` 与 `-tag` 占名额（官方等级表：匿名 2 / 免费会员 2 / Gold 6 / Platinum 不限）。超限时 Danbooru 返回 `TagLimitError`，节点会把原文和提示一起报出来。
+*   `seed` (Int): `-1` = 每次运行重新抽（真随机，覆盖全库）；固定值 = 由种子推导「页码 + 页内序号」，**可复现**且不占标签名额。窄查询（结果不足 20 万条）时推导出的页可能已越过末页，节点会**按同一 seed 退到更浅的页**（50 → 5 → 1）重试，只有第 1 页也空才报「没有匹配」。外接（链接）种子交给 ComfyUI 自身的缓存签名判断。
+*   `size` (Combo: `sample` / `original` / `720x720` / `360x360` / `180x180`): 默认 `sample`；原图常有 5MB+ 的超大分辨率，参考用途建议保持 `sample`。**缓存按「档位 + md5」分别存**，换档会真的重新下载该档，不会拿旧档顶替。
+*   `tag_character` / `tag_copyright` / `tag_general` (Boolean): 默认开启，分别对应 `tag_string_character` / `_copyright` / `_general`。
+*   `tag_artist` (Boolean): 默认关闭；开启后画师标签自动加 `@` 前缀（Anima 的画师写法）。
+*   `tag_meta` (Boolean): 默认关闭。meta 基本是上传元信息（`highres`、`character_request` 等），放进提示词没有好处。
+*   `block_tags` / `use_default_blocklist` (String / Boolean): 默认屏蔽 `artist_name`、`character_request`、`commentary_request`、`bad_id`、`watermark`、`english_text` 等「描述上传」而非「描述画面」的标签；可追加自己的屏蔽词，或整体关掉。**每行/每个逗号一个标签**（空格不切分，所以 `black hair` 与 `black_hair` 都表示同一个标签）。
+*   `login` / `api_key` (String): 可选。留空则读环境变量 `DANBOORU_LOGIN` / `DANBOORU_API_KEY`（**不要写进工作流**，也不发给 CDN）。API key 能解锁被审查（censored）标签、读写收藏，但**不会提升标签数量上限**。
+*   `max_attempts` / `timeout` / `cache_dir`: 真随机模式下的重试次数（抽到视频/动图会重抽）、单次请求超时、图片缓存目录（默认 `input/danbooru_cache`）。整次运行另有总预算 `timeout × max_attempts`（默认 60 秒），用尽即报错而不是继续干等；缓存文件名是 `<档位>-<md5>.<ext>`，只保留最新 **500** 个（只清理本节点写的文件）。
+*   输出：`image` (IMAGE)、`artist` / `character` / `copyright` / `general`（分组标签字符串）、`prompt`（按 **画师 → 角色 → 作品 → 其余 → meta** 顺序拼好的整串）、`meta`（JSON：id / rating / score / source / 图片地址 / 是否命中缓存 等）。
+*   只取静态图：`file_ext` 只接受 jpg/jpeg/png/webp/gif，带 `animated` / `video` 标签的帖子直接跳过（**刻意不用 `-animated` 排除**，因为那会占掉一个标签名额）。
+*   网络兜底：本网络下 `danbooru.donmai.us` 会被错误解析（实测拿到 Dropbox 段的地址、请求超时），节点内置了实测可用的 Cloudflare 地址，**仅在正常请求失败时**启用（连接仍按真实域名做 SNI 与证书校验）；也可以把域名交给启动层的 hosts 钉定（`launch/dns.py`）。
+*   零第三方依赖：请求只用标准库，Pillow / torch 仅在 ComfyUI 运行时用于解码。
+
+> [!NOTE]
+> `robots.txt` 禁止抓取 `/*.json`，所以本节点刻意把请求压到最低：每次运行 **1 次搜索 + 1 次图片**（命中缓存则只要 1 次；真随机抽到不合适的内容才重抽，最多 `max_attempts` 次），不做批量预抓，默认只取 `rating:general`。
 
 ---
 
