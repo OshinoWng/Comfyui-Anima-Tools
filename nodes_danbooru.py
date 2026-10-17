@@ -16,6 +16,11 @@ What the site allows, verified 2026-10-12 against danbooru.donmai.us:
   (``help:users``) gives 2 tags to anonymous *and* to a free Member account, 6 to
   Gold; so an API key is worth having - it also unlocks censored tags, which the
   anonymous ``tag_string`` hides - but it does not lift this limit.
+* ``rating:general,sensitive,explicit`` is **one** term, an OR over the listed
+  ratings (verified 2026-10-17 on safebooru, which runs the same software: the
+  three single-rating counts add up to the multi-value count), so that is how a
+  run draws from every tier.  ``rating:*`` is *not* a wildcard - it matches
+  nothing.
 * ``/posts.json?tags=...&random=1`` returns one random post from the whole set,
   ``counts/posts.json`` returns the match count, and ``limit`` up to 200 works
   together with ``page``.
@@ -26,7 +31,10 @@ Network reality: on this project's networks ``danbooru.donmai.us`` is answered b
 a poisoned DNS record (it resolved to a Dropbox address from CN), which makes the
 first request time out.  ``HOST_PINS`` therefore carries Cloudflare addresses that
 were probed by hand; they are used *only* when the normal request fails, and the
-connection keeps the real hostname for SNI and certificate validation.
+connection keeps the real hostname for SNI and certificate validation.  A host
+that needed them is remembered for the rest of the process (``_PINNED_GOOD``), so
+only the first run pays the dead-DNS timeout; pinning the domains at startup
+(``comfyui-run/launch/dns.py``) removes even that one.
 
 Zero third-party dependencies on purpose - the pack declares
 ``dependencies = []``, the CI installs nothing, and this container has no Pillow
@@ -86,6 +94,27 @@ DEFAULT_BLOCKED_TAGS = (
     "third-party_edit",
 )
 
+# ``rating:general,sensitive`` is ONE search term on the site (an OR over the
+# listed ratings), so the commas inside it must survive comma-splitting.  A
+# ``rating:`` followed by an ordinary tag still splits, so ``rating:g, 1girl``
+# keeps meaning "general posts that have 1girl".
+RATING_VALUES = (
+    "general",
+    "sensitive",
+    "questionable",
+    "explicit",
+    "g",
+    "s",
+    "q",
+    "e",
+)
+_RATING_LIST = re.compile(
+    r"rating:\s*(?:%s)\b(?:\s*,\s*(?:%s)\b)+"
+    % ("|".join(RATING_VALUES), "|".join(RATING_VALUES)),
+    re.IGNORECASE,
+)
+_RATING_COMMA = "\x00"
+
 MAX_PAGE = 1000  # anonymous and Member accounts stop here (help:users)
 PAGE_LIMIT = 200  # verified: limit=200 answers fine anonymously
 RANDOM_MODE_LIMIT = 1
@@ -109,6 +138,11 @@ HOST_PINS = {
     "cdn.donmai.us": ("104.26.10.39", "104.26.11.39", "172.67.70.99"),
     "safebooru.donmai.us": ("172.67.70.99",),
 }
+
+# Hosts that already needed the pins in this process.  Remembering them saves a
+# full ``timeout`` on every later request, which matters because a run always
+# searches the site (only the image is served from the cache).
+_PINNED_GOOD = set()
 
 # Headers are only sent to hosts that can legitimately see the API key.
 DANBOORU_HOSTS = ("danbooru.donmai.us", "safebooru.donmai.us")
@@ -149,17 +183,33 @@ def normalize_post_tag(value):
     return " ".join(str(value if value is not None else "").strip().lower().replace("_", " ").split())
 
 
+def _protect_rating_lists(value):
+    """Freeze the commas inside ``rating:a,b`` so the splitter cannot eat them."""
+
+    if isinstance(value, (list, tuple, set)):
+        return [_protect_rating_lists(item) for item in value]
+    if value is None:
+        return value
+    return _RATING_LIST.sub(
+        lambda match: re.sub(r"\s+", "", match.group(0)).replace(",", _RATING_COMMA),
+        str(value),
+    )
+
+
 def normalize_query_tags(value):
     """Turn user input into Danbooru search syntax.
 
     A comma is an extra convenience, a space is a separator (that is how the site
     reads ``tags=``), and underscores are **kept**: search talks about
     ``black_hair``, while the space form is only how a tag is written in a prompt.
+    A comma-separated rating list (``rating:general,sensitive,explicit``) is kept
+    as one term - the site reads it as "any of these ratings" - which is how a
+    run can draw from all three tiers instead of being pinned to one.
     """
 
     tags = []
-    for part in split_query_parts(value):
-        tag = part.strip().lower()
+    for part in split_query_parts(_protect_rating_lists(value)):
+        tag = part.strip().lower().replace(_RATING_COMMA, ",")
         if tag and tag not in tags:
             tags.append(tag)
     return tags
@@ -534,19 +584,33 @@ def http_get(url, timeout=DEFAULT_TIMEOUT, headers=None):
 
     A real HTTP status is final - it is the site's answer, not a broken DNS - so
     only a connection-level ``URLError`` falls through to the pinned addresses.
+    Once a host has *needed* those pins it is remembered for the rest of the
+    process: with a poisoned DNS every request would otherwise pay the full
+    ``timeout`` again before getting anywhere (there is one search per run).
     """
 
-    try:
-        return _plain_get(url, timeout=timeout, headers=headers)
-    except urllib.error.URLError as error:
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if host in _PINNED_GOOD:
         try:
             return _pinned_get(url, timeout=timeout, headers=headers)
+        except DanbooruError as pinned_error:
+            if pinned_error.status is not None:
+                raise  # the site answered; another DNS round trip cannot help
+            _PINNED_GOOD.discard(host)  # the address drifted - let DNS try again
+
+    try:
+        data = _plain_get(url, timeout=timeout, headers=headers)
+    except urllib.error.URLError as error:
+        try:
+            data = _pinned_get(url, timeout=timeout, headers=headers)
         except DanbooruError as pinned_error:
             raise DanbooruError(
                 "%s 无法访问：正常解析失败（%s），内置 IP 兜底也失败（%s）。"
                 "若一直如此，把域名加进启动层的 hosts 钉定（launch/dns.py）。"
-                % (urllib.parse.urlsplit(url).hostname, error, pinned_error)
+                % (host, error, pinned_error)
             ) from pinned_error
+        _PINNED_GOOD.add(host)
+    return data
 
 
 def error_message_from_payload(payload):

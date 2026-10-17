@@ -221,7 +221,7 @@ LoRA loading and downloading require `.safetensors` files within directories reg
 
 从 Danbooru 随机抽一张图，并把它的标签按 Anima 的写法分组输出（`_` 转空格、小写、去重、英文逗号 + 空格连接、画师加 `@` 前缀），既能喂给 `CLIPTextEncode` 当提示词灵感，也能当参考图。
 
-*   `query_tags` (String): 查询标签，默认 `rating:general`。空格或逗号都能分隔；**匿名与免费账号最多 2 个标签**，其中 `rating:*` 不占名额，而 `random:1` 与 `-tag` 占名额（官方等级表：匿名 2 / 免费会员 2 / Gold 6 / Platinum 不限）。超限时 Danbooru 返回 `TagLimitError`，节点会把原文和提示一起报出来。
+*   `query_tags` (String): 查询标签，默认 `rating:general`。空格或逗号都能分隔；**匿名与免费账号最多 2 个标签**，其中 `rating:*` 不占名额，而 `random:1` 与 `-tag` 占名额（官方等级表：匿名 2 / 免费会员 2 / Gold 6 / Platinum 不限）。超限时 Danbooru 返回 `TagLimitError`，节点会把原文和提示一起报出来。**想看全部三档就写 `rating:general,sensitive,explicit`** —— Danbooru 把这种逗号列表当成「任一档即可」的**单个**查询词（也支持缩写 `rating:g,s,e`，不占标签名额），节点会把它原样保留、不会被逗号拆成多个标签；不写 `rating:` 时站点默认三档全含，但本节点会把空输入兜底成 `rating:general`（安全默认）。注意三档是按帖子实际数量抽的，不是各 1/3。
 *   `seed` (Int): `-1` = 每次运行重新抽（真随机，覆盖全库）；固定值 = 由种子推导「页码 + 页内序号」，**可复现**且不占标签名额。窄查询（结果不足 20 万条）时推导出的页可能已越过末页，节点会**按同一 seed 退到更浅的页**（50 → 5 → 1）重试，只有第 1 页也空才报「没有匹配」。外接（链接）种子交给 ComfyUI 自身的缓存签名判断。
 *   `size` (Combo: `sample` / `original` / `720x720` / `360x360` / `180x180`): 默认 `sample`；原图常有 5MB+ 的超大分辨率，参考用途建议保持 `sample`。**缓存按「档位 + md5」分别存**，换档会真的重新下载该档，不会拿旧档顶替。
 *   `tag_character` / `tag_copyright` / `tag_general` (Boolean): 默认开启，分别对应 `tag_string_character` / `_copyright` / `_general`。
@@ -232,7 +232,7 @@ LoRA loading and downloading require `.safetensors` files within directories reg
 *   `max_attempts` / `timeout` / `cache_dir`: 真随机模式下的重试次数（抽到视频/动图会重抽）、单次请求超时、图片缓存目录（默认 `input/danbooru_cache`）。整次运行另有总预算 `timeout × max_attempts`（默认 60 秒），用尽即报错而不是继续干等；缓存文件名是 `<档位>-<md5>.<ext>`，只保留最新 **500** 个（只清理本节点写的文件）。
 *   输出：`image` (IMAGE)、`artist` / `character` / `copyright` / `general`（分组标签字符串）、`prompt`（按 **画师 → 角色 → 作品 → 其余 → meta** 顺序拼好的整串）、`meta`（JSON：id / rating / score / source / 图片地址 / 是否命中缓存 等）。
 *   只取静态图：`file_ext` 只接受 jpg/jpeg/png/webp/gif，带 `animated` / `video` 标签的帖子直接跳过（**刻意不用 `-animated` 排除**，因为那会占掉一个标签名额）。
-*   网络兜底：本网络下 `danbooru.donmai.us` 会被错误解析（实测拿到 Dropbox 段的地址、请求超时），节点内置了实测可用的 Cloudflare 地址，**仅在正常请求失败时**启用（连接仍按真实域名做 SNI 与证书校验）；也可以把域名交给启动层的 hosts 钉定（`launch/dns.py`）。
+*   网络兜底：本网络下 `danbooru.donmai.us` 会被错误解析（实测拿到 Dropbox 段的地址、请求超时），节点内置了实测可用的 Cloudflare 地址，**仅在正常请求失败时**启用（连接仍按真实域名做 SNI 与证书校验）；也可以把域名交给启动层的 hosts 钉定（`launch/dns.py`，3.1.1 起启动即钉）。⚠️ **第一次请求仍会白等一个 `timeout`**（DNS 投毒：解析成功但连不上），之后同一进程会记住该域名的兜底路线，不再重复等待；想连第一次也省掉，就把 `timeout` 调到 `6~10`，或让启动层先钉 hosts。
 *   零第三方依赖：请求只用标准库，Pillow / torch 仅在 ComfyUI 运行时用于解码。
 
 > [!NOTE]

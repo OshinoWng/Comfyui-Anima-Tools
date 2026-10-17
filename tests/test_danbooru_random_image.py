@@ -221,6 +221,32 @@ class DanbooruNamespaceTests(unittest.TestCase):
             "the site reads a space as a separator, so it must stay two tags",
         )
 
+    def test_a_rating_list_stays_one_search_term(self):
+        """``rating:g,s`` is one term on the site: it means "any of these ratings"."""
+
+        self.assertEqual(
+            self.ns["normalize_query_tags"]("rating:general,sensitive,explicit"),
+            ["rating:general,sensitive,explicit"],
+        )
+        self.assertEqual(
+            self.ns["normalize_query_tags"]("rating:g, s, e"),
+            ["rating:g,s,e"],
+            "spaces around the commas are fine",
+        )
+        self.assertEqual(
+            self.ns["build_request"]("rating:general,sensitive,explicit", -1)["tags"],
+            "rating:general,sensitive,explicit random:1",
+        )
+
+    def test_a_rating_list_does_not_swallow_the_tags_after_it(self):
+        self.assertEqual(
+            self.ns["normalize_query_tags"]("rating:general,sensitive, black_hair"),
+            ["rating:general,sensitive", "black_hair"],
+        )
+        self.assertEqual(
+            self.ns["build_request"]("1girl, rating:g,s", 5)["tags"], "1girl rating:g,s"
+        )
+
     # --- choosing a post ---------------------------------------------------
 
     def test_unusable_posts_are_skipped(self):
@@ -434,6 +460,111 @@ class DanbooruNamespaceTests(unittest.TestCase):
             self.ns["http_get"]("https://danbooru.donmai.us/posts.json")
 
         self.assertIn("403", str(caught.exception))
+
+    def test_the_pinned_route_is_remembered_once_it_worked(self):
+        """A poisoned DNS must not cost the full timeout on *every* run again."""
+
+        asked = []
+
+        def fail(url, timeout=None, headers=None):
+            asked.append("plain")
+            raise urllib.error.URLError("getaddrinfo: 162.125.80.6")
+
+        def pinned(url, timeout=None, headers=None):
+            asked.append("pinned")
+            return b"PINNED"
+
+        self.ns["_plain_get"] = fail
+        self.ns["_pinned_get"] = pinned
+        url = "https://danbooru.donmai.us/posts.json"
+
+        self.assertEqual(self.ns["http_get"](url), b"PINNED")
+        self.assertEqual(self.ns["http_get"](url), b"PINNED")
+        self.assertEqual(asked, ["plain", "pinned", "pinned"])
+
+    def test_the_remembered_route_is_per_host(self):
+        asked = []
+
+        def plain(url, timeout=None, headers=None):
+            asked.append(("plain", url))
+
+            if "danbooru" in url:
+                raise urllib.error.URLError("poisoned")
+
+            return b"PLAIN"
+
+        def pinned(url, timeout=None, headers=None):
+            asked.append(("pinned", url))
+            return b"PINNED"
+
+        self.ns["_plain_get"] = plain
+        self.ns["_pinned_get"] = pinned
+
+        self.ns["http_get"]("https://danbooru.donmai.us/posts.json")
+        self.assertEqual(self.ns["http_get"]("https://cdn.donmai.us/x.jpg"), b"PLAIN")
+        self.assertEqual(
+            asked[-1][0], "plain", "a healthy host must not be pushed onto someone else's pin"
+        )
+
+    def test_a_pin_that_stops_working_hands_the_host_back_to_dns(self):
+        asked = []
+        plain_rounds = []
+
+        def plain(url, timeout=None, headers=None):
+            asked.append("plain")
+            plain_rounds.append(url)
+
+            if len(plain_rounds) == 1:  # the first call is the poisoned one
+                raise urllib.error.URLError("poisoned")
+
+            return b"PLAIN"
+
+        def pinned(url, timeout=None, headers=None):
+            asked.append("pinned")
+            return b"PINNED"
+
+        self.ns["_plain_get"] = plain
+        self.ns["_pinned_get"] = pinned
+        url = "https://danbooru.donmai.us/posts.json"
+        self.assertEqual(self.ns["http_get"](url), b"PINNED")
+
+        def dead_pin(url, timeout=None, headers=None):
+            asked.append("dead-pin")
+            raise self.ns["DanbooruError"]("内置 IP 全部不可达", status=None)
+
+        self.ns["_pinned_get"] = dead_pin
+        self.assertEqual(self.ns["http_get"](url), b"PLAIN")
+        self.assertEqual(asked, ["plain", "pinned", "dead-pin", "plain"])
+
+        self.ns["_pinned_get"] = pinned
+        self.assertEqual(self.ns["http_get"](url), b"PLAIN")
+        self.assertEqual(asked[-1], "plain", "the host stays on the normal route")
+
+    def test_a_site_error_from_the_pinned_route_is_final_too(self):
+        self.ns["_plain_get"] = lambda url, timeout=None, headers=None: (
+            _ for _ in ()
+        ).throw(urllib.error.URLError("poisoned"))
+        self.ns["_pinned_get"] = lambda url, timeout=None, headers=None: b"PINNED"
+        url = "https://danbooru.donmai.us/posts.json"
+        self.ns["http_get"](url)
+
+        asked = []
+
+        def refuse(url, timeout=None, headers=None):
+            asked.append("pinned")
+            raise self.ns["DanbooruError"]("HTTP 403: forbidden", status=403)
+
+        def plain(url, timeout=None, headers=None):
+            asked.append("plain")
+            return b"SHOULD NOT RUN"
+
+        self.ns["_pinned_get"] = refuse
+        self.ns["_plain_get"] = plain
+        with self.assertRaises(self.ns["DanbooruError"]) as caught:
+            self.ns["http_get"](url)
+
+        self.assertIn("403", str(caught.exception))
+        self.assertEqual(asked, ["pinned"], "a real status is the answer, not a broken route")
 
     def test_every_host_that_matters_has_a_pinned_ip(self):
         pins = self.ns["HOST_PINS"]
