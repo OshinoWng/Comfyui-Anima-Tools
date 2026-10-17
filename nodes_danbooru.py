@@ -18,9 +18,11 @@ What the site allows, verified 2026-10-12 against danbooru.donmai.us:
   anonymous ``tag_string`` hides - but it does not lift this limit.
 * ``rating:general,sensitive,explicit`` is **one** term, an OR over the listed
   ratings (verified 2026-10-17 on safebooru, which runs the same software: the
-  three single-rating counts add up to the multi-value count), so that is how a
-  run draws from every tier.  ``rating:*`` is *not* a wildcard - it matches
-  nothing.
+  single-rating counts add up to the multi-value count), and it does not consume
+  a tag slot, so that is how a run draws from several tiers.  The site has a
+  fourth tier, ``questionable`` (``q``, ~1.2M posts): it is accepted in the list
+  too, it is just left out of the examples below.  ``rating:*`` is *not* a
+  wildcard - it matches nothing.
 * ``/posts.json?tags=...&random=1`` returns one random post from the whole set,
   ``counts/posts.json`` returns the match count, and ``limit`` up to 200 works
   together with ``page``.
@@ -33,8 +35,8 @@ first request time out.  ``HOST_PINS`` therefore carries Cloudflare addresses th
 were probed by hand; they are used *only* when the normal request fails, and the
 connection keeps the real hostname for SNI and certificate validation.  A host
 that needed them is remembered for the rest of the process (``_PINNED_GOOD``), so
-only the first run pays the dead-DNS timeout; pinning the domains at startup
-(``comfyui-run/launch/dns.py``) removes even that one.
+only the first request per host pays the dead-DNS timeout; pinning the domains at
+startup (``comfyui-run/launch/dns.py``) removes even that one.
 
 Zero third-party dependencies on purpose - the pack declares
 ``dependencies = []``, the CI installs nothing, and this container has no Pillow
@@ -556,6 +558,7 @@ def _pinned_get(url, timeout=DEFAULT_TIMEOUT, headers=None):
 
     per_candidate = max(1.0, float(timeout or DEFAULT_TIMEOUT) / max(1, len(candidates)))
     last_error = None
+    site_status = None  # a 5xx from any address is still the site answering
     for ip in candidates:
         connection = _SniHTTPSConnection(host, ip, port=parts.port or 443, timeout=per_candidate)
         try:
@@ -570,13 +573,34 @@ def _pinned_get(url, timeout=DEFAULT_TIMEOUT, headers=None):
                 # next pinned IP would just spend time on the same answer.
                 raise error
             last_error = error  # 5xx: this address may be the unlucky one
+            site_status = response.status
         except DanbooruError:
             raise
         except Exception as error:  # try the next candidate address
             last_error = error
         finally:
             connection.close()
-    raise DanbooruError("内置 IP 全部不可达（%s）：%s" % (host, last_error), status=None)
+    # Keep the status of a 5xx: "every address said 500" is still the site
+    # answering, and the caller retries a shallower page on it.  Dropping it
+    # turned that retry into a fake "the network is down".
+    raise DanbooruError(
+        "内置 IP 全部不可达（%s）：%s" % (host, last_error), status=site_status
+    )
+
+
+# A 403/429 from a remembered address can be aimed at that address alone (a
+# Cloudflare challenge, a per-IP rate limit), so DNS gets one more chance.  Any
+# other status is the site answering the query itself and cannot change by
+# asking somewhere else.
+PIN_RETRY_STATUSES = (403, 429)
+
+
+def _unreachable_message(host, plain_error, pinned_error):
+    return (
+        "%s 无法访问：正常解析失败（%s），内置 IP 兜底也失败（%s）。"
+        "若一直如此，把域名加进启动层的 hosts 钉定（launch/dns.py）。"
+        % (host, plain_error, pinned_error)
+    )
 
 
 def http_get(url, timeout=DEFAULT_TIMEOUT, headers=None):
@@ -587,27 +611,45 @@ def http_get(url, timeout=DEFAULT_TIMEOUT, headers=None):
     Once a host has *needed* those pins it is remembered for the rest of the
     process: with a poisoned DNS every request would otherwise pay the full
     ``timeout`` again before getting anywhere (there is one search per run).
+    A 403/429 on that remembered route is the one exception: such a block can be
+    aimed at a single address, so DNS gets one more chance before it is raised.
     """
 
     host = urllib.parse.urlsplit(url).hostname or ""
+    failed_pin = None
     if host in _PINNED_GOOD:
         try:
             return _pinned_get(url, timeout=timeout, headers=headers)
-        except DanbooruError as pinned_error:
-            if pinned_error.status is not None:
-                raise  # the site answered; another DNS round trip cannot help
-            _PINNED_GOOD.discard(host)  # the address drifted - let DNS try again
+        except DanbooruError as error:
+            if error.status is None:
+                _PINNED_GOOD.discard(host)  # the address drifted - let DNS try again
+                failed_pin = error
+            elif error.status in PIN_RETRY_STATUSES:
+                # The block may be aimed at this address; DNS may have recovered.
+                _PINNED_GOOD.discard(host)
+                try:
+                    return _plain_get(url, timeout=timeout, headers=headers)
+                except urllib.error.URLError:
+                    raise error
+            else:
+                raise  # the site answered (422 and friends): another route cannot help
 
     try:
         data = _plain_get(url, timeout=timeout, headers=headers)
-    except urllib.error.URLError as error:
+    except urllib.error.URLError as plain_error:
+        if failed_pin is not None:
+            # The pins were just tried and failed; asking them a second time would
+            # only burn another timeout before reporting the same thing.
+            raise DanbooruError(
+                _unreachable_message(host, plain_error, failed_pin)
+            ) from failed_pin
         try:
             data = _pinned_get(url, timeout=timeout, headers=headers)
         except DanbooruError as pinned_error:
+            if pinned_error.status is not None:
+                raise  # the site answered through the pins too
             raise DanbooruError(
-                "%s 无法访问：正常解析失败（%s），内置 IP 兜底也失败（%s）。"
-                "若一直如此，把域名加进启动层的 hosts 钉定（launch/dns.py）。"
-                % (host, error, pinned_error)
+                _unreachable_message(host, plain_error, pinned_error)
             ) from pinned_error
         _PINNED_GOOD.add(host)
     return data

@@ -540,7 +540,9 @@ class DanbooruNamespaceTests(unittest.TestCase):
         self.assertEqual(self.ns["http_get"](url), b"PLAIN")
         self.assertEqual(asked[-1], "plain", "the host stays on the normal route")
 
-    def test_a_site_error_from_the_pinned_route_is_final_too(self):
+    def test_a_query_error_from_the_pinned_route_is_final_too(self):
+        """A 422 is about the query itself - no other route can answer differently."""
+
         self.ns["_plain_get"] = lambda url, timeout=None, headers=None: (
             _ for _ in ()
         ).throw(urllib.error.URLError("poisoned"))
@@ -552,7 +554,7 @@ class DanbooruNamespaceTests(unittest.TestCase):
 
         def refuse(url, timeout=None, headers=None):
             asked.append("pinned")
-            raise self.ns["DanbooruError"]("HTTP 403: forbidden", status=403)
+            raise self.ns["DanbooruError"]("HTTP 422: too many tags", status=422)
 
         def plain(url, timeout=None, headers=None):
             asked.append("plain")
@@ -563,8 +565,199 @@ class DanbooruNamespaceTests(unittest.TestCase):
         with self.assertRaises(self.ns["DanbooruError"]) as caught:
             self.ns["http_get"](url)
 
-        self.assertIn("403", str(caught.exception))
+        self.assertIn("422", str(caught.exception))
         self.assertEqual(asked, ["pinned"], "a real status is the answer, not a broken route")
+
+    def test_all_pinned_addresses_answering_500_keep_the_site_status(self):
+        """A 500 from every address is still the site answering, not a dead route."""
+
+        class Response:
+            def __init__(self, status, body):
+                self.status = status
+                self._body = body
+
+            def read(self):
+                return self._body
+
+        class Connection:
+            def __init__(self, host, ip, port=None, timeout=None, context=None):
+                pass
+
+            def request(self, method, path, headers=None):
+                pass
+
+            def getresponse(self):
+                return Response(
+                    500, b'{"success":false,"error":"ActiveRecord::QueryCanceled"}'
+                )
+
+            def close(self):
+                pass
+
+        self.ns["_SniHTTPSConnection"] = Connection
+        with self.assertRaises(self.ns["DanbooruError"]) as caught:
+            self.ns["_pinned_get"]("https://danbooru.donmai.us/posts.json?tags=rating%3Ageneral")
+
+        self.assertEqual(
+            caught.exception.status,
+            500,
+            "dropping the status turns a 'retry shallower' into a fake 'unreachable'",
+        )
+
+    def test_a_server_error_from_any_pinned_address_counts_as_an_answer(self):
+        """One 500 plus two unreachable addresses is still the site answering."""
+
+        class Response:
+            def __init__(self, status, body):
+                self.status = status
+                self._body = body
+
+            def read(self):
+                return self._body
+
+        pins = self.ns["HOST_PINS"]["danbooru.donmai.us"]
+
+        class Connection:
+            def __init__(self, host, ip, port=None, timeout=None, context=None):
+                self.ip = ip
+
+            def request(self, method, path, headers=None):
+                if self.ip != pins[0]:
+                    raise OSError("connection timed out")
+
+            def getresponse(self):
+                return Response(
+                    500, b'{"success":false,"error":"ActiveRecord::QueryCanceled"}'
+                )
+
+            def close(self):
+                pass
+
+        self.ns["_SniHTTPSConnection"] = Connection
+        with self.assertRaises(self.ns["DanbooruError"]) as caught:
+            self.ns["_pinned_get"]("https://danbooru.donmai.us/posts.json?tags=rating%3Ageneral")
+
+        self.assertEqual(
+            caught.exception.status,
+            500,
+            "the last address timing out must not hide the answer the site did give",
+        )
+
+    def test_a_server_error_on_the_remembered_route_keeps_the_pins(self):
+        asked = []
+
+        def plain(url, timeout=None, headers=None):
+            asked.append("plain")
+            raise urllib.error.URLError("poisoned")
+
+        def pinned(url, timeout=None, headers=None):
+            asked.append("pinned")
+            return b"PINNED"
+
+        self.ns["_plain_get"] = plain
+        self.ns["_pinned_get"] = pinned
+        url = "https://danbooru.donmai.us/posts.json"
+        self.assertEqual(self.ns["http_get"](url), b"PINNED")
+
+        def busy(url, timeout=None, headers=None):
+            asked.append("busy-pin")
+            raise self.ns["DanbooruError"]("Danbooru 返回 HTTP 500", status=500)
+
+        self.ns["_pinned_get"] = busy
+        with self.assertRaises(self.ns["DanbooruError"]) as caught:
+            self.ns["http_get"](url)
+
+        self.assertEqual(caught.exception.status, 500)
+        self.assertEqual(
+            asked,
+            ["plain", "pinned", "busy-pin"],
+            "a 5xx must not send the host back to a dead DNS (and a dead DNS costs a timeout)",
+        )
+
+        self.ns["_pinned_get"] = pinned
+        self.assertEqual(self.ns["http_get"](url), b"PINNED")
+        self.assertEqual(asked[-1], "pinned", "the pin stays remembered")
+
+    def test_a_blocked_pinned_address_gives_a_recovered_dns_one_chance(self):
+        self.ns["_plain_get"] = lambda url, timeout=None, headers=None: (
+            _ for _ in ()
+        ).throw(urllib.error.URLError("poisoned"))
+        self.ns["_pinned_get"] = lambda url, timeout=None, headers=None: b"PINNED"
+        url = "https://danbooru.donmai.us/posts.json"
+        self.ns["http_get"](url)
+
+        asked = []
+
+        def blocked(url, timeout=None, headers=None):
+            asked.append("pinned")
+            raise self.ns["DanbooruError"]("HTTP 403: challenge", status=403)
+
+        def plain(url, timeout=None, headers=None):
+            asked.append("plain")
+            return b"PLAIN"
+
+        self.ns["_pinned_get"] = blocked
+        self.ns["_plain_get"] = plain
+        self.assertEqual(self.ns["http_get"](url), b"PLAIN")
+        self.assertEqual(asked, ["pinned", "plain"])
+
+        def never(url, timeout=None, headers=None):
+            raise AssertionError("the healthy DNS route must be kept")
+
+        self.ns["_pinned_get"] = never
+        self.assertEqual(
+            self.ns["http_get"](url),
+            b"PLAIN",
+            "a block aimed at the pinned address hands the host back to DNS",
+        )
+
+    def test_a_dead_remembered_route_is_not_asked_twice(self):
+        self.ns["_plain_get"] = lambda url, timeout=None, headers=None: (
+            _ for _ in ()
+        ).throw(urllib.error.URLError("poisoned"))
+        self.ns["_pinned_get"] = lambda url, timeout=None, headers=None: b"PINNED"
+        url = "https://danbooru.donmai.us/posts.json"
+        self.ns["http_get"](url)
+
+        asked = []
+
+        def dead_pin(url, timeout=None, headers=None):
+            asked.append("pinned")
+            raise self.ns["DanbooruError"]("内置 IP 全部不可达", status=None)
+
+        def plain(url, timeout=None, headers=None):
+            asked.append("plain")
+            raise urllib.error.URLError("poisoned")
+
+        self.ns["_pinned_get"] = dead_pin
+        self.ns["_plain_get"] = plain
+        with self.assertRaises(self.ns["DanbooruError"]) as caught:
+            self.ns["http_get"](url)
+
+        self.assertEqual(
+            asked, ["pinned", "plain"], "asking the dead pin again only burns a second timeout"
+        )
+        self.assertIn("无法访问", str(caught.exception))
+        self.assertIn("poisoned", str(caught.exception))
+
+    def test_a_status_from_the_pinned_route_is_not_reported_as_unreachable(self):
+        self.ns["_plain_get"] = lambda url, timeout=None, headers=None: (
+            _ for _ in ()
+        ).throw(urllib.error.URLError("poisoned"))
+
+        def refuse(url, timeout=None, headers=None):
+            raise self.ns["DanbooruError"]("HTTP 403: challenge", status=403)
+
+        self.ns["_pinned_get"] = refuse
+        with self.assertRaises(self.ns["DanbooruError"]) as caught:
+            self.ns["http_get"]("https://danbooru.donmai.us/posts.json")
+
+        self.assertEqual(caught.exception.status, 403)
+        self.assertNotIn(
+            "无法访问",
+            str(caught.exception),
+            "the site answered; calling that 'unreachable' hides the real problem",
+        )
 
     def test_every_host_that_matters_has_a_pinned_ip(self):
         pins = self.ns["HOST_PINS"]
