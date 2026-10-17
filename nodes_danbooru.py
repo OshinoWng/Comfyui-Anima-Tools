@@ -92,6 +92,13 @@ RANDOM_MODE_LIMIT = 1
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_TIMEOUT = 20.0
 CACHE_DIR_NAME = "danbooru_cache"
+# The cache is keyed by upload *and* size, and only files this node wrote are
+# pruned - a user who points cache_dir at a folder of their own keeps it.
+CACHE_MAX_FILES = 500
+CACHE_NAME_PATTERN = re.compile(
+    r"^(?:(?:%s)-)?[0-9a-zA-Z]{6,40}\.(?:jpg|jpeg|png|webp|gif|bin)$"
+    % "|".join(re.escape(size) for size in SIZE_OPTIONS)
+)
 
 # Probed by hand on 2026-10-12: the local resolver answered danbooru with
 # 162.125.80.6 (a Dropbox address) and every request timed out, while these
@@ -108,7 +115,16 @@ DANBOORU_HOSTS = ("danbooru.donmai.us", "safebooru.donmai.us")
 
 
 class DanbooruError(RuntimeError):
-    """Raised for anything the user has to read and act on."""
+    """Raised for anything the user has to read and act on.
+
+    ``status`` is the HTTP status when the site answered at all, so callers can
+    tell "this query is invalid" (4xx - asking again will not help) apart from
+    "the server had a bad moment" (5xx - a shallower page or another try might).
+    """
+
+    def __init__(self, message, status=None):
+        super(DanbooruError, self).__init__(message)
+        self.status = status
 
 
 # --- tags --------------------------------------------------------------------
@@ -150,9 +166,28 @@ def normalize_query_tags(value):
 
 
 def normalize_block_tags(value):
-    """Blocklist entries are compared against prompt-form tags, so align them."""
+    """Blocklist entries are compared against prompt-form tags, so align them.
 
-    return [tag for tag in (normalize_post_tag(part) for part in split_query_parts(value)) if tag]
+    A blocklist entry is one tag, not a search expression: ``black hair`` and
+    ``black_hair`` have to mean the same single tag, while splitting on spaces
+    would turn them into ``black`` + ``hair`` and silently block nothing.  That
+    is why entries are separated by commas/newlines only.
+    """
+
+    return [tag for tag in (normalize_post_tag(part) for part in split_block_parts(value)) if tag]
+
+
+def split_block_parts(value):
+    """Blocklist entries split on commas, semicolons and newlines - spaces stay."""
+
+    if isinstance(value, (list, tuple, set)):
+        parts = []
+        for item in value:
+            parts.extend(split_block_parts(item))
+        return parts
+    if value is None:
+        return []
+    return [part for part in re.split(r"[,\n;]+", str(value)) if part.strip()]
 
 
 def split_query_parts(value):
@@ -252,6 +287,26 @@ def build_request(query_tags, seed, page_limit=PAGE_LIMIT, max_page=MAX_PAGE):
         "mode": "page",
         "seed": value,
     }
+
+
+def page_candidates(page, depths=(50, 5, 1)):
+    """Shallower pages to try, in order, when a derived page comes back empty.
+
+    A fixed seed derives its page from the seed alone, so on a narrow query it
+    can land past the last page: the site answers 200 with ``[]`` and the node
+    used to report "nothing matches this query".  Each fallback stays derived
+    from the seed (same in-page index, a shallower page), so the run is still
+    reproducible, and page 1 last means an empty answer really is "no match".
+    """
+
+    if not page:
+        return [1]
+    pages = [int(page)]
+    for depth in depths:
+        candidate = 1 + (int(page) - 1) % depth
+        if candidate not in pages:
+            pages.append(candidate)
+    return pages
 
 
 def choose_image_url(post, size=DEFAULT_SIZE):
@@ -368,17 +423,56 @@ class _SniHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
 
-def _http_error_message(error):
+TAG_LIMIT_HINT = (
+    "（匿名与免费账号最多 2 个标签，且 rating: 不占名额，random:1 / -tag 占名额；"
+    "要更多标签需要 Gold 账号，详见 help:users）"
+)
+
+
+def _payload_message(body):
+    """Pull the site's own message out of an error body, JSON or not."""
+
+    if not body:
+        return ""
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", "replace")
+    text = str(body).strip()
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        payload = None
+    message = error_message_from_payload(payload) if isinstance(payload, dict) else ""
+    if message:
+        return message
+    if "<html" in text.lower():
+        return "站点返回了 HTML 拦截页（Cloudflare challenge），稍后重试"
+    return " ".join(text.split())[:200]
+
+
+def _http_error_message(error, body=b""):
+    """Say what went wrong in the site's own words, then add an actionable hint."""
+
     status = getattr(error, "code", "?")
     hints = {
+        400: "请求被拒绝（400）",
         401: "鉴权失败：检查 login / api_key（API key 在 Danbooru 个人主页生成）",
-        403: "被拒绝（403）：可能是 UA 或权限问题",
+        403: "被拒绝（403）：可能是 Cloudflare 拦截 / UA / 权限问题",
         404: "资源不存在（404）",
+        422: "查询不被接受（422）：最常见的是标签超限",
         429: "被限速（429）：稍后重试，或加上 API key",
+        500: "站点内部错误（500）：换个 seed 或稍后重试",
         503: "站点暂时不可用（503）",
     }
+    detail = _payload_message(body)
+    text = "Danbooru 返回 HTTP %s" % status
+    if detail:
+        text = "%s：%s" % (text, detail)
     hint = hints.get(status, "")
-    return "Danbooru 返回 HTTP %s%s" % (status, "：%s" % hint if hint else "")
+    if hint:
+        text = "%s［%s］" % (text, hint)
+    if status == 422 or "more than" in detail:
+        text = "%s%s" % (text, TAG_LIMIT_HINT)
+    return text
 
 
 def _plain_get(url, timeout=DEFAULT_TIMEOUT, headers=None):
@@ -387,7 +481,15 @@ def _plain_get(url, timeout=DEFAULT_TIMEOUT, headers=None):
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.read()
     except urllib.error.HTTPError as error:
-        raise DanbooruError(_http_error_message(error)) from error
+        # The body carries the site's own explanation (TagLimitError, a database
+        # timeout, a Cloudflare challenge); dropping it left bare "HTTP 422".
+        try:
+            body = error.read(4096)
+        except Exception:  # the body is a bonus, not the point
+            body = b""
+        raise DanbooruError(
+            _http_error_message(error, body), status=getattr(error, "code", None)
+        ) from error
 
 
 def _pinned_get(url, timeout=DEFAULT_TIMEOUT, headers=None):
@@ -402,23 +504,29 @@ def _pinned_get(url, timeout=DEFAULT_TIMEOUT, headers=None):
     if parts.query:
         path = "%s?%s" % (path, parts.query)
 
+    per_candidate = max(1.0, float(timeout or DEFAULT_TIMEOUT) / max(1, len(candidates)))
     last_error = None
     for ip in candidates:
-        connection = _SniHTTPSConnection(host, ip, port=parts.port or 443, timeout=timeout)
+        connection = _SniHTTPSConnection(host, ip, port=parts.port or 443, timeout=per_candidate)
         try:
             connection.request("GET", path, headers=dict(headers or {}))
             response = connection.getresponse()
             data = response.read()
-            if response.status >= 400:
-                raise DanbooruError(_http_error_message(response))
-            return data
+            if response.status < 400:
+                return data
+            error = DanbooruError(_http_error_message(response, data), status=response.status)
+            if response.status < 500:
+                # A 4xx is the site's answer, not a broken address - asking the
+                # next pinned IP would just spend time on the same answer.
+                raise error
+            last_error = error  # 5xx: this address may be the unlucky one
         except DanbooruError:
             raise
         except Exception as error:  # try the next candidate address
             last_error = error
         finally:
             connection.close()
-    raise DanbooruError("内置 IP 全部不可达（%s）：%s" % (host, last_error))
+    raise DanbooruError("内置 IP 全部不可达（%s）：%s" % (host, last_error), status=None)
 
 
 def http_get(url, timeout=DEFAULT_TIMEOUT, headers=None):
@@ -455,10 +563,7 @@ def raise_for_payload_error(payload):
         return
     hint = ""
     if "TagLimitError" in str(payload.get("error") or "") or "more than" in message:
-        hint = (
-            "（匿名与免费账号最多 2 个标签，且 rating: 不占名额，random:1 / -tag 占名额；"
-            "要更多标签需要 Gold 账号，详见 help:users）"
-        )
+        hint = TAG_LIMIT_HINT
     raise DanbooruError("Danbooru 拒绝了这次查询：%s%s" % (message, hint))
 
 
@@ -491,14 +596,54 @@ def default_cache_dir():
     return os.path.join(base, CACHE_DIR_NAME)
 
 
-def cache_file_path(cache_dir, post):
-    """One file per upload, named after its md5 so a repeat run costs nothing."""
+def cache_file_path(cache_dir, post, size=DEFAULT_SIZE):
+    """One file per upload *and* resolution, so changing ``size`` really re-draws.
+
+    The md5 alone collides: every variant of a post shares it, so asking for
+    ``original`` after ``sample`` would silently hand back the small file that
+    was cached first - and the ``size`` widget would then be lying.
+    """
 
     post = post if isinstance(post, dict) else {}
     stem = str(post.get("md5") or post.get("id") or "unknown")
     extension = str(post.get("file_ext") or "bin")
-    name = re.sub(r"[^0-9A-Za-z._-]", "_", "%s.%s" % (stem, extension))
+    prefix = str(size or DEFAULT_SIZE)
+    name = re.sub(r"[^0-9A-Za-z._-]", "_", "%s-%s.%s" % (prefix, stem, extension))
     return os.path.join(str(cache_dir), name)
+
+
+def prune_cache(cache_dir, max_files=CACHE_MAX_FILES):
+    """Keep the newest ``max_files`` files this node wrote; return how many went.
+
+    Only names matching ``CACHE_NAME_PATTERN`` are touched: ``cache_dir`` can be
+    pointed at a folder of the user's own, and everything else in there is theirs.
+    """
+
+    directory = str(cache_dir or "")
+    if not directory or max_files is None or int(max_files) <= 0:
+        return 0
+    try:
+        names = [name for name in os.listdir(directory) if CACHE_NAME_PATTERN.match(name)]
+    except OSError:
+        return 0
+    if len(names) <= int(max_files):
+        return 0
+    aged = []
+    for name in names:
+        path = os.path.join(directory, name)
+        try:
+            aged.append((os.path.getmtime(path), name))
+        except OSError:
+            continue
+    aged.sort(reverse=True)
+    removed = 0
+    for _, name in aged[int(max_files) :]:
+        try:
+            os.remove(os.path.join(directory, name))
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def load_image_tensor(data):
@@ -592,13 +737,47 @@ class AnimaDanbooruRandomImage:
         # again; a fixed seed reads one page and scans forward inside it instead
         # (asking for the same page twice would return the same posts).
         attempts_limit = max(1, int(max_attempts or 1)) if random_mode else 1
+        timeout = float(timeout or DEFAULT_TIMEOUT)
+        # One budget for the whole run: without it a dead network cost
+        # timeout x (one plain request + every pinned address) x attempts.
+        deadline = time.monotonic() + timeout * attempts_limit
+        pages = [] if random_mode else page_candidates(request["page"])
+        page_index = 0
+        max_rounds = attempts_limit if random_mode else max(1, len(pages))
 
         post = None
         attempts = 0
-        for _ in range(attempts_limit):
+        spent_budget = False
+        tried_page = request.get("page")
+        for _ in range(max_rounds):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.5:
+                spent_budget = True
+                break
             attempts += 1
-            posts = fetch_posts(request, timeout=timeout, headers=headers)
+            if random_mode:
+                round_request = request
+            else:
+                tried_page = pages[page_index]
+                round_request = dict(request, page=tried_page)
+            try:
+                posts = fetch_posts(
+                    round_request, timeout=min(timeout, remaining), headers=headers
+                )
+            except DanbooruError as error:
+                # A 5xx on a deep page is usually "the database timed out"; the
+                # same query on a shallower page can still answer.  A 4xx (tag
+                # limit, auth) will not change, so it is raised as is.
+                if not random_mode and (error.status or 0) >= 500 and page_index + 1 < len(pages):
+                    page_index += 1
+                    continue
+                raise
             if not posts:
+                if not random_mode and page_index + 1 < len(pages):
+                    # The derived page is past the end of this query's result
+                    # set: try a shallower page derived from the same seed.
+                    page_index += 1
+                    continue
                 raise DanbooruError(
                     "Danbooru 没有任何帖子匹配「%s」。换个标签组合，或先用 counts/posts.json 看看量。"
                     % request["tags"]
@@ -606,12 +785,23 @@ class AnimaDanbooruRandomImage:
             candidate = pick_post(posts, request["index"], size=size)
             if candidate is not None:
                 post = candidate
+                request = round_request
                 break
+            if not random_mode and page_index + 1 < len(pages):
+                # The page answered but held nothing decodable: walk shallower
+                # instead of asking for the very same page again.
+                page_index += 1
         if post is None:
+            if spent_budget:
+                raise DanbooruError(
+                    "本次运行的时间预算（约 %.0f 秒 = timeout × max_attempts）已用尽，"
+                    "只试了 %d 次。把 timeout 调大，或把 max_attempts 调小。"
+                    % (timeout * attempts_limit, attempts)
+                )
             if not random_mode:
                 raise DanbooruError(
                     "第 %s 页里没有可用的静态图（多是视频/动图或已删除）。"
-                    "换个 seed，或把 size 换成更可能有预览图的档位。" % request["page"]
+                    "换个 seed，或把 size 换成更可能有预览图的档位。" % tried_page
                 )
             raise DanbooruError(
                 "连续 %d attempt 都没抽到可用的静态图（匹配到的多是视频/动图或已删除）。"
@@ -621,7 +811,7 @@ class AnimaDanbooruRandomImage:
         image_url = choose_image_url(post, size)
         directory = str(cache_dir or "").strip() or default_cache_dir()
         os.makedirs(directory, exist_ok=True)
-        path = cache_file_path(directory, post)
+        path = cache_file_path(directory, post, size=size)
         cached = os.path.isfile(path)
         if cached:
             with open(path, "rb") as handle:
@@ -630,6 +820,7 @@ class AnimaDanbooruRandomImage:
             data = http_get(image_url, timeout=timeout, headers=headers_for_url(headers, image_url))
             with open(path, "wb") as handle:
                 handle.write(data)
+            prune_cache(directory)
 
         groups = format_tag_groups(
             post,
@@ -649,7 +840,7 @@ class AnimaDanbooruRandomImage:
                 "image_height": post.get("image_height"),
                 "image_url": image_url,
                 "size": size,
-                "cached_file": path,
+                "cached_file": os.path.basename(path),
                 "cached": cached,
                 "attempts": attempts,
                 "mode": request["mode"],

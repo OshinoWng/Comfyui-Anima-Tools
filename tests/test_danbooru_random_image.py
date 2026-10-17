@@ -13,6 +13,7 @@ import ast
 import base64
 import hashlib
 import http.client
+import io
 import json
 import os
 import random
@@ -30,49 +31,28 @@ from pathlib import Path
 
 MODULE_NAME = "nodes_danbooru.py"
 
-# The module is exec'd from its top-level statements, so its imports never run and
-# every stdlib name it uses has to be handed over by hand.
-STDLIB_NAMES = (
-    "base64",
-    "hashlib",
-    "http",
-    "json",
-    "os",
-    "random",
-    "re",
-    "socket",
-    "ssl",
-    "tempfile",
-    "time",
-    "urllib",
-)
-
 
 def load_danbooru_namespace():
+    """Exec the module's top level without ComfyUI, Pillow or torch installed.
+
+    The module's own ``import`` statements run for real, so a missing import
+    fails here exactly like it would inside ComfyUI; only the function and class
+    bodies are defined and never called.  The two seams that need the outside
+    world - ``http_get`` and ``load_image_tensor`` - are replaced by the tests.
+    """
+
     module_path = Path(__file__).resolve().parents[1] / MODULE_NAME
     tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
     body = [
         node
         for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Assign, ast.AnnAssign))
+        if isinstance(
+            node,
+            (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.ClassDef, ast.Assign, ast.AnnAssign),
+        )
+        and not (isinstance(node, ast.ImportFrom) and node.module == "__future__")
     ]
     namespace = {"__file__": str(module_path), "__name__": "nodes_danbooru"}
-    namespace.update(
-        {
-            "base64": base64,
-            "hashlib": hashlib,
-            "http": http,
-            "json": json,
-            "os": os,
-            "random": random,
-            "re": re,
-            "socket": socket,
-            "ssl": ssl,
-            "tempfile": tempfile,
-            "time": time,
-            "urllib": urllib,
-        }
-    )
     exec(
         compile(ast.Module(body=body, type_ignores=[]), str(module_path), "exec"),
         namespace,
@@ -143,11 +123,10 @@ class FakeHttp:
 
 
 class DanbooruNamespaceTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.ns = load_danbooru_namespace()
-
     def setUp(self):
+        # A fresh namespace per test: the seams below are replaced in place, so a
+        # shared module would leak one test's fake ``http_get`` into the next.
+        self.ns = load_danbooru_namespace()
         self.node_class = self.ns["AnimaDanbooruRandomImage"]
         self.node = self.node_class()
 
@@ -299,7 +278,7 @@ class DanbooruNamespaceTests(unittest.TestCase):
                 query_tags="rating:general", seed=20261012, cache_dir=cache_dir
             )
 
-            cached_file = os.path.join(cache_dir, "%s.jpg" % post["md5"])
+            cached_file = os.path.join(cache_dir, "sample-%s.jpg" % post["md5"])
             self.assertTrue(os.path.isfile(cached_file))
 
         self.assertEqual(first[0], ("tensor", b"IMAGEBYTES"))
@@ -473,7 +452,7 @@ class DanbooruNamespaceTests(unittest.TestCase):
         self.assertIn("Anima-Tools", headers["User-Agent"])
         self.assertIn("User-Agent", headers)
 
-    def test_a_half_filled_credential_pair_is_ignored_with_a_warning(self):
+    def test_a_half_filled_credential_pair_is_ignored(self):
         headers = self.ns["build_headers"]("someone", "")
 
         self.assertNotIn("Authorization", headers)
@@ -521,6 +500,257 @@ class DanbooruNamespaceTests(unittest.TestCase):
         second = self.node_class.IS_CHANGED(seed=7, query_tags="rating:general", api_key="b")
 
         self.assertEqual(first, second)
+
+    # --- regressions found in the 2026-10-17 review ------------------------
+
+    def _fail_urlopen(self, code, reason, body):
+        """Make the next ``_plain_get`` answer with a real ``HTTPError`` carrier."""
+
+        error = urllib.error.HTTPError(
+            "https://danbooru.donmai.us/posts.json", code, reason, {}, io.BytesIO(body)
+        )
+        original = urllib.request.urlopen
+        urllib.request.urlopen = lambda *args, **kwargs: (_ for _ in ()).throw(error)
+        self.addCleanup(setattr, urllib.request, "urlopen", original)
+
+    def test_an_http_422_keeps_the_sites_message_and_explains_the_tag_budget(self):
+        body = json.dumps(
+            {
+                "success": False,
+                "error": "PostQuery::TagLimitError",
+                "message": "You cannot search for more than 2 tags at a time.",
+            }
+        ).encode("utf-8")
+        self._fail_urlopen(422, "Unprocessable Content", body)
+
+        with self.assertRaises(self.ns["DanbooruError"]) as caught:
+            self.ns["_plain_get"]("https://danbooru.donmai.us/posts.json?tags=1girl+solo+cup")
+
+        message = str(caught.exception)
+        self.assertIn("more than 2 tags", message)
+        self.assertIn("rating:", message)
+        self.assertIn("random:1", message, "the hint has to name the slot random:1 spends")
+        self.assertEqual(caught.exception.status, 422)
+
+    def test_an_http_500_keeps_the_sites_message_and_status(self):
+        body = json.dumps(
+            {
+                "success": False,
+                "error": "ActiveRecord::QueryCanceled",
+                "message": "The database timed out running your query.",
+            }
+        ).encode("utf-8")
+        self._fail_urlopen(500, "Internal Server Error", body)
+
+        with self.assertRaises(self.ns["DanbooruError"]) as caught:
+            self.ns["_plain_get"]("https://danbooru.donmai.us/posts.json?tags=rating:general&page=50")
+
+        self.assertIn("timed out", str(caught.exception))
+        self.assertEqual(caught.exception.status, 500)
+
+    def test_a_block_tag_written_with_spaces_blocks_the_whole_tag(self):
+        groups = self.ns["format_tag_groups"](
+            sample_post(tag_string_general="black_hair 1girl"), block_tags="black hair"
+        )
+
+        self.assertEqual(groups["general"], "1girl")
+
+    def test_block_tags_are_separated_by_commas_or_newlines(self):
+        groups = self.ns["format_tag_groups"](
+            sample_post(tag_string_general="1girl solo smile"), block_tags="smile,\nsolo"
+        )
+
+        self.assertEqual(groups["general"], "1girl")
+
+    def test_the_cache_file_name_keeps_the_requested_size(self):
+        paths = {
+            size: self.ns["cache_file_path"]("/cache", sample_post(), size)
+            for size in ("sample", "original")
+        }
+
+        self.assertNotEqual(paths["sample"], paths["original"])
+        self.assertIn("sample", os.path.basename(paths["sample"]))
+        self.assertIn("original", os.path.basename(paths["original"]))
+
+    def test_changing_the_size_downloads_the_other_variant(self):
+        post = sample_post()
+        http = FakeHttp([[post], b"SAMPLE_BYTES", [post], b"ORIGINAL_BYTES"])
+        self.ns["http_get"] = http
+        self.ns["load_image_tensor"] = lambda data: data
+        with tempfile.TemporaryDirectory() as cache_dir:
+            first = self.node.fetch_random_post(
+                query_tags="rating:general", seed=5, size="sample", cache_dir=cache_dir
+            )
+            second = self.node.fetch_random_post(
+                query_tags="rating:general", seed=5, size="original", cache_dir=cache_dir
+            )
+
+        self.assertEqual(first[0], b"SAMPLE_BYTES")
+        self.assertEqual(second[0], b"ORIGINAL_BYTES", "a new size must not reuse the other variant")
+        self.assertFalse(json.loads(second[6])["cached"])
+
+    def test_a_fixed_seed_past_the_end_of_the_result_set_falls_back_to_a_shallower_page(self):
+        post = sample_post()
+        seed = next(
+            value
+            for value in range(1000)
+            if self.ns["build_request"]("rating:general touhou", value)["page"] > 500
+        )
+        deep_page = self.ns["build_request"]("rating:general touhou", seed)["page"]
+        pages = []
+
+        def answer(url, headers=None):
+            if "posts.json" not in url:
+                return b"IMAGEBYTES"
+            pages.append(int(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["page"][0]))
+            if pages[-1] == deep_page:
+                return b"[]"
+            return json.dumps([post]).encode("utf-8")
+
+        self.ns["http_get"] = FakeHttp([answer, answer, answer, b"IMAGEBYTES"])
+        self.ns["load_image_tensor"] = lambda data: ("tensor", data)
+        with tempfile.TemporaryDirectory() as cache_dir:
+            result = self.node.fetch_random_post(
+                query_tags="rating:general touhou", seed=seed, cache_dir=cache_dir
+            )
+
+        self.assertEqual(json.loads(result[6])["id"], post["id"])
+        self.assertGreater(len(pages), 1, "an empty page has to be retried, not reported as 'no match'")
+        self.assertLess(pages[-1], deep_page, "the retry must be shallower than the empty page")
+
+    def test_a_page_of_videos_walks_shallower_instead_of_asking_again(self):
+        seed = next(
+            value
+            for value in range(1000)
+            if self.ns["build_request"]("rating:general touhou", value)["page"] > 500
+        )
+        pages = []
+
+        def answer(url, timeout=None, headers=None):
+            pages.append(int(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["page"][0]))
+            return json.dumps([sample_post(file_ext="mp4")]).encode("utf-8")
+
+        self.ns["http_get"] = answer
+        with tempfile.TemporaryDirectory() as cache_dir:
+            with self.assertRaises(RuntimeError) as caught:
+                self.node.fetch_random_post(
+                    query_tags="rating:general touhou", seed=seed, cache_dir=cache_dir
+                )
+
+        self.assertEqual(len(pages), len(set(pages)), "the same page must never be asked twice")
+        self.assertEqual(pages[-1], 1, "the walk has to end on page 1")
+        self.assertIn("页", str(caught.exception))
+
+    def test_a_tag_limit_error_is_not_retried_on_another_page(self):
+        error = self.ns["DanbooruError"]("You cannot search for more than 2 tags at a time.")
+        error.status = 422
+        http = FakeHttp([error, error, error])
+        self.ns["http_get"] = http
+        with tempfile.TemporaryDirectory() as cache_dir:
+            with self.assertRaises(self.ns["DanbooruError"]):
+                self.node.fetch_random_post(query_tags="1girl solo", seed=7, cache_dir=cache_dir)
+
+        self.assertEqual(len(http.urls), 1, "a 422 cannot change by asking another page")
+
+    def test_the_pinned_fallback_moves_to_the_next_address_after_a_server_error(self):
+        payload = json.dumps([sample_post()]).encode("utf-8")
+        attempted = []
+        pins = self.ns["HOST_PINS"]["danbooru.donmai.us"]
+
+        class Response:
+            def __init__(self, status, body):
+                self.status = status
+                self._body = body
+
+            def read(self):
+                return self._body
+
+        class Connection:
+            def __init__(self, host, ip, port=None, timeout=None, context=None):
+                self.ip = ip
+                attempted.append(ip)
+
+            def request(self, method, path, headers=None):
+                pass
+
+            def getresponse(self):
+                if self.ip == pins[0]:
+                    return Response(500, b'{"success":false,"message":"The database is unavailable."}')
+                return Response(200, payload)
+
+            def close(self):
+                pass
+
+        self.ns["_SniHTTPSConnection"] = Connection
+        data = self.ns["_pinned_get"]("https://danbooru.donmai.us/posts.json?tags=rating%3Ageneral")
+
+        self.assertEqual(json.loads(data)[0]["id"], sample_post()["id"])
+        self.assertEqual(attempted[:2], [pins[0], pins[1]])
+
+    def test_the_cache_drops_its_oldest_entries_but_not_other_files(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            for index in range(5):
+                path = os.path.join(cache_dir, "sample-%032d.jpg" % index)
+                with open(path, "wb") as handle:
+                    handle.write(b"x")
+                os.utime(path, (1000 + index, 1000 + index))
+            mine = os.path.join(cache_dir, "notes.txt")
+            with open(mine, "w", encoding="utf-8") as handle:
+                handle.write("mine")
+
+            removed = self.ns["prune_cache"](cache_dir, max_files=3)
+
+            self.assertEqual(removed, 2)
+            remaining = sorted(
+                name for name in os.listdir(cache_dir) if name.startswith("sample-")
+            )
+            self.assertEqual(remaining, ["sample-%032d.jpg" % index for index in (2, 3, 4)])
+            self.assertTrue(os.path.isfile(mine), "files the node did not write must be left alone")
+
+    def test_the_meta_does_not_leak_the_cache_directory(self):
+        self.ns["http_get"] = FakeHttp([[sample_post()], b"IMAGEBYTES"])
+        self.ns["load_image_tensor"] = lambda data: ("tensor", data)
+        with tempfile.TemporaryDirectory() as cache_dir:
+            result = self.node.fetch_random_post(query_tags="rating:general", cache_dir=cache_dir)
+
+        self.assertEqual(
+            json.loads(result[6])["cached_file"], "sample-%s.jpg" % sample_post()["md5"]
+        )
+
+    def test_the_run_stops_when_its_time_budget_is_used_up(self):
+        class Clock:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+            def time(self):
+                return self.now
+
+        clock = Clock()
+        requests = []
+
+        def answer(url, timeout=None, headers=None):
+            requests.append(timeout)
+            clock.now += 5.0
+            return json.dumps([sample_post(file_ext="mp4")]).encode("utf-8")
+
+        self.ns["time"] = clock
+        self.ns["http_get"] = answer
+        with tempfile.TemporaryDirectory() as cache_dir:
+            with self.assertRaises(RuntimeError) as caught:
+                self.node.fetch_random_post(
+                    query_tags="rating:general", timeout=2.0, max_attempts=3, cache_dir=cache_dir
+                )
+
+        self.assertIn("时间预算", str(caught.exception))
+        self.assertEqual(len(requests), 2, "the third attempt would run past the budget")
+        self.assertTrue(all(value <= 2.0 for value in requests))
+
+    def test_the_module_namespace_carries_the_real_imports(self):
+        """The loader must run the module's own imports, not a hand-kept list."""
+
+        self.assertIn("io", self.ns)
 
 
 if __name__ == "__main__":
