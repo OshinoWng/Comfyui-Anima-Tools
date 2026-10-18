@@ -865,22 +865,24 @@ class AnimaPromptComposer:
         """Tell ComfyUI whether the prompt drawn by the previous run may be reused.
 
         Only *constants* reach this method: an input driven by a link is passed as
-        ``None`` (``execution.py::IsChangedCache.get`` calls
-        ``get_input_data(..., execution_list=None)``, "we only want constants in
-        IS_CHANGED"), so the value of a linked seed is unknown here.  Answering
-        with a timestamp in that case marked the node as changed on every queue -
-        even when the link carried a fixed seed - so the node and everything
-        downstream of it re-ran on every Run and no fixed seed could ever produce
-        a cached image.
+        ``(None,)`` (``execution.py::IsChangedCache.get`` calls
+        ``get_input_data(..., execution_list=None)``, whose ``mark_missing`` wraps
+        it: "we only want constants in IS_CHANGED"), so the value of a linked seed
+        is unknown here.  Answering with a timestamp in that case marked the node
+        as changed on every queue - even when the link carried a fixed seed - so
+        the node and everything downstream of it re-ran on every Run and no fixed
+        seed could ever produce a cached image.
         """
         import hashlib
         import json
         import time
 
         seed = kwargs.get("seed", -1)
-        if seed is None or isinstance(seed, list):
-            # A link (plain links arrive as ``None``, ``rawLink``/v3 ones as a
-            # list): its value only exists at execution time.  A constant answer
+        if seed is None or isinstance(seed, (list, tuple, dict)):
+            # A link: current ComfyUI wraps the missing value as ``(None,)``, older
+            # versions handed over ``None`` or ``[None]``, and a v3 ``rawLink`` may
+            # arrive as a list/dict.  Any non-scalar is a link - a real seed is an
+            # int.  Its value only exists at execution time; a constant answer
             # leaves the decision to ComfyUI's own signature, which includes the
             # link *and* the upstream node's signature - an upstream that changes
             # still invalidates this node, an unchanged one is cached.
