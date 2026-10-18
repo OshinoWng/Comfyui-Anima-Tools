@@ -205,6 +205,20 @@ class DanbooruNamespaceTests(unittest.TestCase):
         self.assertEqual(first["id_ceiling"], self.ns["DEFAULT_ID_CEILING"])
         self.assertTrue(1 <= first["anchor"] <= first["id_ceiling"])
 
+    def test_the_new_input_is_optional_and_sits_last(self):
+        """A required input breaks old API workflows, and a widget inserted in the middle
+        shifts every later ``widgets_values`` entry of an existing workflow."""
+
+        inputs = self.node_class.INPUT_TYPES()
+
+        self.assertNotIn("id_ceiling", inputs["required"], "an old workflow does not have it")
+        self.assertEqual(
+            list(inputs["optional"])[-1],
+            "id_ceiling",
+            "new inputs are appended, never inserted",
+        )
+        self.assertIn("default", inputs["optional"]["id_ceiling"][1])
+
     def test_the_default_id_ceiling_covers_the_known_corpus(self):
         """A ceiling under the corpus cannot reach the newest posts; far over it is dead space."""
 
@@ -223,23 +237,48 @@ class DanbooruNamespaceTests(unittest.TestCase):
             self.assertEqual(request["id_ceiling"], self.ns["DEFAULT_ID_CEILING"], value)
             self.assertLessEqual(request["anchor"], self.ns["DEFAULT_ID_CEILING"])
 
-    def test_the_id_window_never_wraps_past_the_ceiling(self):
+    def test_the_id_window_ends_at_the_anchor_and_only_reaches_older_ids(self):
+        """An upload always gets a bigger id, so a window ending at the anchor is closed for good."""
+
         windows = self.ns["id_windows"](990, 1_000)
 
-        self.assertEqual(windows, [(990, 1_000)], "the window stops at the ceiling, it does not wrap to 1")
+        self.assertEqual(windows[0], (791, 990), "the narrowest window is the 200 ids below the anchor")
+        self.assertTrue(all(end == 990 for start, end in windows), "widening only reaches older ids")
+        self.assertEqual(
+            [start for start, end in windows],
+            sorted({start for start, end in windows}, reverse=True),
+            "every wider window has to contain the previous one",
+        )
         self.assertTrue(all(1 <= start <= end <= 1_000 for start, end in windows))
 
-    def test_the_smallest_usable_id_in_the_window_wins(self):
-        """The answer is newest-first; the anchor decides, not the position in it."""
+    def test_a_window_near_id_1_stops_at_1_instead_of_wrapping(self):
+        windows = self.ns["id_windows"](5, 1_000)
+
+        self.assertEqual(windows, [(1, 5)], "the window is clamped at 1 and de-duplicated")
+
+    def test_an_anchor_above_the_ceiling_is_clamped_to_it(self):
+        windows = self.ns["id_windows"](2_000, 1_000)
+
+        self.assertTrue(all(end == 1_000 for start, end in windows))
+
+    def test_the_newest_usable_post_in_the_window_wins(self):
+        """Newest-first answers plus a window that ends at the anchor: the head is the answer."""
 
         posts = [
             sample_post(id=12000050),
+            sample_post(id=12000049, file_ext="mp4", file_url="https://cdn.donmai.us/o.mp4"),
             sample_post(id=12000010),
-            sample_post(id=12000001, file_ext="mp4", file_url="https://cdn.donmai.us/o.mp4"),
         ]
 
-        self.assertEqual(self.ns["pick_earliest_post"](posts)["id"], 12000010)
-        self.assertIsNone(self.ns["pick_earliest_post"]([sample_post(file_ext="mp4")]))
+        self.assertEqual(self.ns["pick_latest_post"](posts)["id"], 12000050)
+        self.assertIsNone(self.ns["pick_latest_post"]([sample_post(file_ext="mp4")]))
+
+    def test_a_truncated_window_still_holds_the_post_that_is_picked(self):
+        """``limit`` drops the *oldest* ids of a wide window - the newest one always survives."""
+
+        posts = [sample_post(id=12_000_000 - offset) for offset in range(200)]
+
+        self.assertEqual(self.ns["pick_latest_post"](posts)["id"], 12_000_000)
 
     def test_query_tags_are_normalised_and_defaulted(self):
         self.assertEqual(self.ns["build_request"]("1Girl, Solo", -1)["tags"], "1girl solo random:1")
@@ -1049,7 +1088,9 @@ class DanbooruNamespaceTests(unittest.TestCase):
         anchor = self.ns["build_request"]("rating:general", 99)["anchor"]
         self.assertNotIn("page", query, "a page number is what moved when the site gained posts")
         self.assertEqual(query["limit"], ["200"])
-        self.assertRegex(query["tags"][0], r"^rating:general id:%d\.\.\d+$" % anchor)
+        found = re.fullmatch(r"rating:general id:(\d+)\.\.(\d+)", query["tags"][0])
+        self.assertEqual(int(found.group(2)), anchor, "the window ends at the anchor")
+        self.assertLess(int(found.group(1)), anchor)
 
     def test_an_empty_id_window_widens_before_moving_to_the_next_anchor(self):
         ranges = []
@@ -1072,9 +1113,30 @@ class DanbooruNamespaceTests(unittest.TestCase):
             )
 
         self.assertEqual(len(ranges), 3)
-        self.assertEqual(ranges[0][0], ranges[1][0], "the same anchor has to be widened first")
-        self.assertLess(ranges[0][1], ranges[1][1])
+        self.assertEqual(ranges[0][1], ranges[1][1], "the same anchor is widened first")
+        self.assertGreater(ranges[0][0], ranges[1][0], "widening reaches further back in time")
         self.assertEqual(json.loads(result[6])["id"], sample_post()["id"])
+
+    def test_a_timeout_retries_the_same_window_instead_of_widening(self):
+        ranges = []
+
+        def answer(url, timeout=None, headers=None):
+            if "posts.json" not in url:
+                return b"IMAGEBYTES"
+            tags = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["tags"][0]
+            found = re.search(r"id:(\d+)\.\.(\d+)", tags)
+            ranges.append((int(found.group(1)), int(found.group(2))))
+            if len(ranges) == 1:
+                raise self.ns["DanbooruError"]("超时", transient=True)
+            return json.dumps([sample_post()]).encode("utf-8")
+
+        self.ns["http_get"] = answer
+        self.ns["load_image_tensor"] = lambda data: data
+        with tempfile.TemporaryDirectory() as cache_dir:
+            self.node.fetch_random_post(query_tags="rating:general", seed=5, cache_dir=cache_dir)
+
+        self.assertEqual(len(ranges), 2)
+        self.assertEqual(ranges[0], ranges[1], "a dead network must not change which post the seed means")
 
     def test_a_window_of_videos_widens_instead_of_asking_the_same_range_twice(self):
         ranges = []
@@ -1110,6 +1172,7 @@ class DanbooruNamespaceTests(unittest.TestCase):
         self.assertEqual(meta["id_ceiling"], self.ns["DEFAULT_ID_CEILING"])
         self.assertRegex(meta["id_window"], r"^\d+\.\.\d+$")
         self.assertRegex(meta["anchor"].__str__(), r"^\d+$")
+        self.assertEqual(int(meta["id_window"].split("..")[1]), meta["anchor"])
 
     def test_a_tag_limit_error_is_not_retried_in_another_window(self):
         error = self.ns["DanbooruError"]("You cannot search for more than 2 tags at a time.")
