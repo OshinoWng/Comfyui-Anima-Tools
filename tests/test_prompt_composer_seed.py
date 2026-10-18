@@ -111,6 +111,19 @@ class AnimaPromptComposerSeedTests(unittest.TestCase):
         self.assertEqual(first, repeated)
         self.assertEqual(first, other_link, "the link itself is part of ComfyUI's own signature")
 
+    def test_a_seed_link_that_arrives_as_a_one_tuple_is_a_link_too(self):
+        """Current ComfyUI hands ``IS_CHANGED`` ``(None,)`` for a linked input
+        (``get_input_data(..., execution_list=None)`` -> ``mark_missing``), not a
+        bare ``None``.  Missing that made a linked fixed seed re-run every queue."""
+
+        first = self.composer_class.IS_CHANGED(**self.inputs, seed=(None,), resolved_prompt="")
+        repeated = self.composer_class.IS_CHANGED(
+            **self.inputs, seed=(None,), resolved_prompt="redrawn"
+        )
+
+        self.assertEqual(first, "linked")
+        self.assertEqual(first, repeated)
+
     def test_random_seed_still_re_draws_on_every_queue(self):
         first = self.composer_class.IS_CHANGED(**self.inputs, seed=-1)
         time.sleep(0.002)
