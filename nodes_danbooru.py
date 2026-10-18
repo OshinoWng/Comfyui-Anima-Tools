@@ -26,8 +26,15 @@ What the site allows, verified 2026-10-12 against danbooru.donmai.us:
 * ``/posts.json?tags=...&random=1`` returns one random post from the whole set,
   ``counts/posts.json`` returns the match count, and ``limit`` up to 200 works
   together with ``page``.
+* Post ids are the one stable key the site has: they only ever grow, they are
+  never reused (deleted posts leave gaps - there is no post 2), and tag edits or
+  score changes do not touch them.  ``order:id`` sorts ascending, verified
+  2026-10-18 (``1girl order:id`` answered ids 1 and 3).  A page number, by
+  contrast, is an offset into a newest-first list, so every upload shifts it.
 * ``robots.txt`` disallows ``/*.json``, so this node keeps its footprint tiny:
   one search request plus one image request per run, always through the cache.
+  Only a seeded anchor with nothing around it costs extra searches, and those
+  stay inside the same time budget as the random path.
 
 Network reality: on this project's networks ``danbooru.donmai.us`` is answered by
 a poisoned DNS record (it resolved to a Dropbox address from CN), which makes the
@@ -117,8 +124,16 @@ _RATING_LIST = re.compile(
 )
 _RATING_COMMA = "\x00"
 
-MAX_PAGE = 1000  # anonymous and Member accounts stop here (help:users)
-PAGE_LIMIT = 200  # verified: limit=200 answers fine anonymously
+# A seeded run samples the *id space*, not a page: post ids only ever grow, so a
+# post at a given id never moves when the site uploads something new, while a page
+# number shifts by every upload.  The ceiling freezes that space and has to sit
+# just above the site's current largest id - a seed landing above it could never
+# resolve.  12,401,582 was the largest post id on 2026-10-18; the small headroom
+# below 12.5M fills up within days of uploads.
+DEFAULT_ID_CEILING = 12_500_000
+ID_WINDOW_LIMIT = 200  # verified: limit=200 answers fine anonymously
+ID_WINDOW_WIDTHS = (200, 2_000, 20_000, 200_000)
+ID_ANCHOR_ATTEMPTS = 3
 RANDOM_MODE_LIMIT = 1
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_TIMEOUT = 20.0
@@ -312,13 +327,64 @@ def coerce_seed(seed):
         return -1
 
 
-def build_request(query_tags, seed, page_limit=PAGE_LIMIT, max_page=MAX_PAGE):
-    """Describe the one request the node will make.
+def coerce_id_ceiling(value):
+    """A ceiling has to be a positive id, otherwise every window is empty."""
+
+    try:
+        ceiling = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_ID_CEILING
+    return ceiling if ceiling > 0 else DEFAULT_ID_CEILING
+
+
+def id_anchors(seed, ceiling=DEFAULT_ID_CEILING, attempts=ID_ANCHOR_ATTEMPTS):
+    """Where a fixed seed starts looking, one anchor per attempt.
+
+    Every anchor is a pure function of ``(seed, attempt, ceiling)``: recompute it
+    a year later and it is the same number.  The extra attempts only matter for a
+    seed that lands where no matching post exists any more (the tail of the id
+    space, or a query with nothing near it); they keep that fallback reproducible
+    instead of "draw another random number and hope".
+    """
+
+    ceiling = coerce_id_ceiling(ceiling)
+    anchors = []
+    for attempt in range(max(1, int(attempts or 1))):
+        digest = hashlib.sha1(
+            ("danbooru-seed:%d:%d" % (int(seed), attempt)).encode("utf-8")
+        ).digest()
+        anchor = int.from_bytes(digest[:8], "big") % ceiling + 1
+        if anchor not in anchors:
+            anchors.append(anchor)
+    return anchors
+
+
+def id_windows(anchor, ceiling=DEFAULT_ID_CEILING, widths=ID_WINDOW_WIDTHS):
+    """Windows starting at the anchor, narrowest first, clamped to the ceiling.
+
+    A window is stable against uploads: a new post always gets a bigger id than
+    any id already inside it, so it can never appear there.  A window only
+    shrinks (a deleted post leaves a gap), which is why the pick below is the
+    smallest id rather than "the n-th post".
+    """
+
+    ceiling = coerce_id_ceiling(ceiling)
+    start = min(max(1, int(anchor or 1)), ceiling)
+    windows = []
+    for width in widths:
+        end = min(start + max(1, int(width)) - 1, ceiling)
+        if not windows or end > windows[-1][1]:
+            windows.append((start, end))
+    return windows
+
+
+def build_request(query_tags, seed, id_ceiling=DEFAULT_ID_CEILING):
+    """Describe the first request the node will make.
 
     A random seed asks the site for ``random:1`` - a true draw over the whole
-    matching set, at the cost of one tag slot.  A fixed seed instead derives a
-    page and an index from the seed, which needs no extra tag slot, stays inside
-    the documented page limit and is reproducible: same seed, same request.
+    matching set, at the cost of one tag slot.  A fixed seed instead derives an
+    **id anchor** and reads a window of ids from there: post ids only ever grow,
+    so the post at that anchor does not move when the site uploads something new.
     """
 
     tags = normalize_query_tags(query_tags) or [DEFAULT_QUERY_TAGS]
@@ -327,41 +393,29 @@ def build_request(query_tags, seed, page_limit=PAGE_LIMIT, max_page=MAX_PAGE):
         return {
             "tags": " ".join(tags + ["random:%d" % RANDOM_MODE_LIMIT]),
             "limit": RANDOM_MODE_LIMIT,
-            "page": None,
-            "index": 0,
             "mode": "random",
             "seed": value,
+            "id_ceiling": None,
         }
 
-    digest = hashlib.sha1(("danbooru-seed:%d" % value).encode("utf-8")).digest()
+    ceiling = coerce_id_ceiling(id_ceiling)
     return {
         "tags": " ".join(tags),
-        "limit": page_limit,
-        "page": int.from_bytes(digest[:4], "big") % max_page + 1,
-        "index": int.from_bytes(digest[4:8], "big") % page_limit,
-        "mode": "page",
+        "limit": ID_WINDOW_LIMIT,
+        "mode": "id",
         "seed": value,
+        "id_ceiling": ceiling,
+        "anchor": id_anchors(value, ceiling, 1)[0],
     }
 
 
-def page_candidates(page, depths=(50, 5, 1)):
-    """Shallower pages to try, in order, when a derived page comes back empty.
+def request_tag_string(request):
+    """The search string for one round: the query plus its id window."""
 
-    A fixed seed derives its page from the seed alone, so on a narrow query it
-    can land past the last page: the site answers 200 with ``[]`` and the node
-    used to report "nothing matches this query".  Each fallback stays derived
-    from the seed (same in-page index, a shallower page), so the run is still
-    reproducible, and page 1 last means an empty answer really is "no match".
-    """
-
-    if not page:
-        return [1]
-    pages = [int(page)]
-    for depth in depths:
-        candidate = 1 + (int(page) - 1) % depth
-        if candidate not in pages:
-            pages.append(candidate)
-    return pages
+    tags = str(request.get("tags") or DEFAULT_QUERY_TAGS)
+    if request.get("id_end"):
+        tags = "%s id:%d..%d" % (tags, int(request["id_start"]), int(request["id_end"]))
+    return tags
 
 
 def choose_image_url(post, size=DEFAULT_SIZE):
@@ -419,6 +473,26 @@ def pick_post(posts, index=0, size=DEFAULT_SIZE):
         if is_usable_post(post, size=size):
             return post
     return None
+
+
+def pick_earliest_post(posts, size=DEFAULT_SIZE):
+    """The usable post with the smallest id - the first one after the anchor.
+
+    Deliberately not "the n-th post": an index would shift whenever *any* post in
+    the window is deleted, while the smallest id only disappears together with
+    that one post.  The site answers newest-first, so this also means a newer
+    upload inside the window can never displace the seeded pick.
+    """
+
+    usable = []
+    for post in posts if isinstance(posts, (list, tuple)) else ():
+        if not is_usable_post(post, size=size):
+            continue
+        try:
+            usable.append((int(post.get("id")), post))
+        except (TypeError, ValueError):
+            continue
+    return min(usable, key=lambda pair: pair[0])[1] if usable else None
 
 
 # --- talking to the site -----------------------------------------------------
@@ -704,9 +778,10 @@ def raise_for_payload_error(payload):
 
 
 def fetch_posts(request, timeout=DEFAULT_TIMEOUT, headers=None):
-    params = {"tags": request.get("tags") or DEFAULT_QUERY_TAGS, "limit": int(request.get("limit") or 1)}
-    if request.get("page"):
-        params["page"] = int(request["page"])
+    params = {
+        "tags": request_tag_string(request),
+        "limit": int(request.get("limit") or 1),
+    }
     url = "%s?%s" % (DANBOORU_POSTS_URL, urllib.parse.urlencode(params))
     payload = json.loads(http_get(url, timeout=timeout, headers=headers))
     raise_for_payload_error(payload)
@@ -828,6 +903,10 @@ class AnimaDanbooruRandomImage:
                 "api_key": ("STRING", {"default": ""}),
                 "cache_dir": ("STRING", {"default": ""}),
                 "timeout": ("FLOAT", {"default": DEFAULT_TIMEOUT, "min": 1.0, "max": 120.0}),
+                "id_ceiling": (
+                    "INT",
+                    {"default": DEFAULT_ID_CEILING, "min": 1, "max": 2147483647},
+                ),
             },
         }
 
@@ -853,6 +932,7 @@ class AnimaDanbooruRandomImage:
         api_key="",
         cache_dir="",
         timeout=DEFAULT_TIMEOUT,
+        id_ceiling=DEFAULT_ID_CEILING,
     ):
         tag_types = tuple(
             name
@@ -867,35 +947,37 @@ class AnimaDanbooruRandomImage:
         )
         login, api_key = resolve_credentials(login, api_key)
         headers = build_headers(login, api_key)
-        request = build_request(query_tags, seed)
+        request = build_request(query_tags, seed, id_ceiling=id_ceiling)
         random_mode = request["mode"] == "random"
-        # A random draw can land on something unusable, so it is worth asking
-        # again; a fixed seed reads one page and scans forward inside it instead
-        # (asking for the same page twice would return the same posts).
-        attempts_limit = max(1, int(max_attempts or 1)) if random_mode else 1
+        attempts_limit = max(1, int(max_attempts or 1))
         timeout = float(timeout or DEFAULT_TIMEOUT)
         # One budget for the whole run: without it a dead network cost
-        # timeout x (one plain request + every pinned address) x attempts.
+        # timeout x (one plain request + every pinned address) x rounds.
         deadline = time.monotonic() + timeout * attempts_limit
-        pages = [] if random_mode else page_candidates(request["page"])
-        page_index = 0
-        max_rounds = attempts_limit if random_mode else max(1, len(pages))
+        # A random draw can land on something unusable, so the same request is
+        # worth asking again.  A fixed seed instead has a deterministic list of
+        # windows - narrow to wide within one anchor, then the next anchor - and
+        # every one of them is a pure function of the seed, so a retry can never
+        # turn into "a different random post".
+        if random_mode:
+            rounds = [request] * attempts_limit
+        else:
+            rounds = [
+                dict(request, id_start=start, id_end=end)
+                for anchor in id_anchors(request["seed"], request["id_ceiling"], attempts_limit)
+                for start, end in id_windows(anchor, request["id_ceiling"])
+            ]
 
         post = None
         attempts = 0
         spent_budget = False
-        tried_page = request.get("page")
-        for _ in range(max_rounds):
+        for index, round_request in enumerate(rounds):
             remaining = deadline - time.monotonic()
             if remaining <= 0.5:
                 spent_budget = True
                 break
             attempts += 1
-            if random_mode:
-                round_request = request
-            else:
-                tried_page = pages[page_index]
-                round_request = dict(request, page=tried_page)
+            request = round_request
             try:
                 posts = fetch_posts(
                     round_request, timeout=min(timeout, remaining), headers=headers
@@ -904,34 +986,34 @@ class AnimaDanbooruRandomImage:
                 # A timeout or a dropped connection says nothing about the query,
                 # so it is worth another round while the budget lasts - otherwise a
                 # single stalled read (20 s by default) killed the whole run.
-                if getattr(error, "transient", False) and attempts < max_rounds:
+                if getattr(error, "transient", False) and index + 1 < len(rounds):
                     continue
-                # A 5xx on a deep page is usually "the database timed out"; the
-                # same query on a shallower page can still answer.  A 4xx (tag
-                # limit, auth) will not change, so it is raised as is.
-                if not random_mode and (error.status or 0) >= 500 and page_index + 1 < len(pages):
-                    page_index += 1
+                # A 5xx is the site having a bad moment; the next window (wider,
+                # or at another anchor) can still answer.  A 4xx (tag limit,
+                # auth) will not change, so it is raised as is.
+                if (error.status or 0) >= 500 and index + 1 < len(rounds):
                     continue
                 raise
             if not posts:
-                if not random_mode and page_index + 1 < len(pages):
-                    # The derived page is past the end of this query's result
-                    # set: try a shallower page derived from the same seed.
-                    page_index += 1
-                    continue
-                raise DanbooruError(
-                    "Danbooru 没有任何帖子匹配「%s」。换个标签组合，或先用 counts/posts.json 看看量。"
-                    % request["tags"]
-                )
-            candidate = pick_post(posts, request["index"], size=size)
+                if random_mode:
+                    # ``random:1`` answers ``[]`` only when nothing matches at
+                    # all; asking again cannot change that.
+                    raise DanbooruError(
+                        "Danbooru 没有任何帖子匹配「%s」。换个标签组合，或先用 counts/posts.json 看看量。"
+                        % request["tags"]
+                    )
+                # An empty window is normal near the end of the id space: widen
+                # it, then try the next anchor.  The last round falls through to
+                # the error below.
+                continue
+            candidate = (
+                pick_post(posts, 0, size=size)
+                if random_mode
+                else pick_earliest_post(posts, size=size)
+            )
             if candidate is not None:
                 post = candidate
-                request = round_request
                 break
-            if not random_mode and page_index + 1 < len(pages):
-                # The page answered but held nothing decodable: walk shallower
-                # instead of asking for the very same page again.
-                page_index += 1
         if post is None:
             if spent_budget:
                 raise DanbooruError(
@@ -941,8 +1023,15 @@ class AnimaDanbooruRandomImage:
                 )
             if not random_mode:
                 raise DanbooruError(
-                    "第 %s 页里没有可用的静态图（多是视频/动图或已删除）。"
-                    "换个 seed，或把 size 换成更可能有预览图的档位。" % tried_page
+                    "固定 seed 在 id %s..%s 附近的 %d 个窗口里都没有可用的静态图"
+                    "（id_ceiling=%s：窗口可能落在作品 id 之外，或窗口里只有视频/动图、"
+                    "已删除的帖子）。换个 seed，或把 id_ceiling 调到当前作品上限附近。"
+                    % (
+                        request.get("id_start"),
+                        request.get("id_end"),
+                        len(rounds),
+                        request.get("id_ceiling"),
+                    )
                 )
             raise DanbooruError(
                 "连续 %d attempt 都没抽到可用的静态图（匹配到的多是视频/动图或已删除）。"
@@ -986,6 +1075,13 @@ class AnimaDanbooruRandomImage:
                 "attempts": attempts,
                 "mode": request["mode"],
                 "seed": request["seed"],
+                "anchor": request.get("id_start"),
+                "id_window": (
+                    "%d..%d" % (request["id_start"], request["id_end"])
+                    if request.get("id_start")
+                    else None
+                ),
+                "id_ceiling": request.get("id_ceiling"),
             },
             ensure_ascii=False,
             sort_keys=True,

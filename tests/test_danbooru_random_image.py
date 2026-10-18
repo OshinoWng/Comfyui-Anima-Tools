@@ -189,20 +189,57 @@ class DanbooruNamespaceTests(unittest.TestCase):
 
         self.assertIn("random:1", request["tags"])
         self.assertEqual(request["limit"], 1)
-        self.assertIsNone(request["page"])
         self.assertEqual(request["mode"], "random")
 
-    def test_a_fixed_seed_maps_to_a_stable_page_and_index(self):
+    def test_a_fixed_seed_maps_to_a_stable_id_anchor(self):
         first = self.ns["build_request"]("rating:general", 20261012)
         repeated = self.ns["build_request"]("rating:general", 20261012)
         other = self.ns["build_request"]("rating:general", 20261013)
 
         self.assertEqual(first, repeated)
-        self.assertNotEqual(first, other)
-        self.assertEqual(first["mode"], "page")
-        self.assertNotIn("random:1", first["tags"], "the page path must not spend a tag slot")
-        self.assertTrue(1 <= first["page"] <= self.ns["MAX_PAGE"])
-        self.assertTrue(0 <= first["index"] < first["limit"])
+        self.assertNotEqual(first["anchor"], other["anchor"])
+        self.assertEqual(first["mode"], "id")
+        self.assertEqual(first["tags"], "rating:general", "the query stays free of the id range")
+        self.assertNotIn("random:1", first["tags"], "the id path must not spend a tag slot")
+        self.assertEqual(first["limit"], self.ns["ID_WINDOW_LIMIT"])
+        self.assertEqual(first["id_ceiling"], self.ns["DEFAULT_ID_CEILING"])
+        self.assertTrue(1 <= first["anchor"] <= first["id_ceiling"])
+
+    def test_the_default_id_ceiling_covers_the_known_corpus(self):
+        """A ceiling under the corpus cannot reach the newest posts; far over it is dead space."""
+
+        self.assertGreaterEqual(self.ns["DEFAULT_ID_CEILING"], 12_401_582)
+        self.assertLess(
+            self.ns["DEFAULT_ID_CEILING"],
+            12_401_582 * 2,
+            "a ceiling far above the corpus spends most seeds on an id space "
+            "that will never hold a post",
+        )
+
+    def test_a_broken_id_ceiling_falls_back_to_the_default(self):
+        for value in (0, -5, None, "nonsense"):
+            request = self.ns["build_request"]("rating:general", 7, id_ceiling=value)
+
+            self.assertEqual(request["id_ceiling"], self.ns["DEFAULT_ID_CEILING"], value)
+            self.assertLessEqual(request["anchor"], self.ns["DEFAULT_ID_CEILING"])
+
+    def test_the_id_window_never_wraps_past_the_ceiling(self):
+        windows = self.ns["id_windows"](990, 1_000)
+
+        self.assertEqual(windows, [(990, 1_000)], "the window stops at the ceiling, it does not wrap to 1")
+        self.assertTrue(all(1 <= start <= end <= 1_000 for start, end in windows))
+
+    def test_the_smallest_usable_id_in_the_window_wins(self):
+        """The answer is newest-first; the anchor decides, not the position in it."""
+
+        posts = [
+            sample_post(id=12000050),
+            sample_post(id=12000010),
+            sample_post(id=12000001, file_ext="mp4", file_url="https://cdn.donmai.us/o.mp4"),
+        ]
+
+        self.assertEqual(self.ns["pick_earliest_post"](posts)["id"], 12000010)
+        self.assertIsNone(self.ns["pick_earliest_post"]([sample_post(file_ext="mp4")]))
 
     def test_query_tags_are_normalised_and_defaulted(self):
         self.assertEqual(self.ns["build_request"]("1Girl, Solo", -1)["tags"], "1girl solo random:1")
@@ -1001,59 +1038,80 @@ class DanbooruNamespaceTests(unittest.TestCase):
         self.assertEqual(second[0], b"ORIGINAL_BYTES", "a new size must not reuse the other variant")
         self.assertFalse(json.loads(second[6])["cached"])
 
-    def test_a_fixed_seed_past_the_end_of_the_result_set_falls_back_to_a_shallower_page(self):
-        post = sample_post()
-        seed = next(
-            value
-            for value in range(1000)
-            if self.ns["build_request"]("rating:general touhou", value)["page"] > 500
-        )
-        deep_page = self.ns["build_request"]("rating:general touhou", seed)["page"]
-        pages = []
-
-        def answer(url, headers=None):
-            if "posts.json" not in url:
-                return b"IMAGEBYTES"
-            pages.append(int(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["page"][0]))
-            if pages[-1] == deep_page:
-                return b"[]"
-            return json.dumps([post]).encode("utf-8")
-
-        self.ns["http_get"] = FakeHttp([answer, answer, answer, b"IMAGEBYTES"])
-        self.ns["load_image_tensor"] = lambda data: ("tensor", data)
+    def test_a_seeded_run_asks_for_an_id_range_not_a_page(self):
+        http = FakeHttp([[sample_post()], b"IMAGEBYTES"])
+        self.ns["http_get"] = http
+        self.ns["load_image_tensor"] = lambda data: data
         with tempfile.TemporaryDirectory() as cache_dir:
-            result = self.node.fetch_random_post(
-                query_tags="rating:general touhou", seed=seed, cache_dir=cache_dir
-            )
+            self.node.fetch_random_post(query_tags="rating:general", seed=99, cache_dir=cache_dir)
 
-        self.assertEqual(json.loads(result[6])["id"], post["id"])
-        self.assertGreater(len(pages), 1, "an empty page has to be retried, not reported as 'no match'")
-        self.assertLess(pages[-1], deep_page, "the retry must be shallower than the empty page")
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(http.urls[0]).query)
+        anchor = self.ns["build_request"]("rating:general", 99)["anchor"]
+        self.assertNotIn("page", query, "a page number is what moved when the site gained posts")
+        self.assertEqual(query["limit"], ["200"])
+        self.assertRegex(query["tags"][0], r"^rating:general id:%d\.\.\d+$" % anchor)
 
-    def test_a_page_of_videos_walks_shallower_instead_of_asking_again(self):
-        seed = next(
-            value
-            for value in range(1000)
-            if self.ns["build_request"]("rating:general touhou", value)["page"] > 500
-        )
-        pages = []
+    def test_an_empty_id_window_widens_before_moving_to_the_next_anchor(self):
+        ranges = []
 
         def answer(url, timeout=None, headers=None):
-            pages.append(int(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["page"][0]))
+            if "posts.json" not in url:
+                return b"IMAGEBYTES"
+            tags = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["tags"][0]
+            found = re.search(r"id:(\d+)\.\.(\d+)", tags)
+            ranges.append((int(found.group(1)), int(found.group(2))))
+            if len(ranges) < 3:
+                return b"[]"
+            return json.dumps([sample_post()]).encode("utf-8")
+
+        self.ns["http_get"] = answer
+        self.ns["load_image_tensor"] = lambda data: data
+        with tempfile.TemporaryDirectory() as cache_dir:
+            result = self.node.fetch_random_post(
+                query_tags="rating:general", seed=7, cache_dir=cache_dir
+            )
+
+        self.assertEqual(len(ranges), 3)
+        self.assertEqual(ranges[0][0], ranges[1][0], "the same anchor has to be widened first")
+        self.assertLess(ranges[0][1], ranges[1][1])
+        self.assertEqual(json.loads(result[6])["id"], sample_post()["id"])
+
+    def test_a_window_of_videos_widens_instead_of_asking_the_same_range_twice(self):
+        ranges = []
+
+        def answer(url, timeout=None, headers=None):
+            tags = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["tags"][0]
+            found = re.search(r"id:(\d+)\.\.(\d+)", tags)
+            ranges.append((int(found.group(1)), int(found.group(2))))
             return json.dumps([sample_post(file_ext="mp4")]).encode("utf-8")
 
         self.ns["http_get"] = answer
         with tempfile.TemporaryDirectory() as cache_dir:
-            with self.assertRaises(RuntimeError) as caught:
+            with self.assertRaises(self.ns["DanbooruError"]) as caught:
                 self.node.fetch_random_post(
-                    query_tags="rating:general touhou", seed=seed, cache_dir=cache_dir
+                    query_tags="rating:general", seed=11, cache_dir=cache_dir
                 )
 
-        self.assertEqual(len(pages), len(set(pages)), "the same page must never be asked twice")
-        self.assertEqual(pages[-1], 1, "the walk has to end on page 1")
-        self.assertIn("页", str(caught.exception))
+        self.assertEqual(len(ranges), len(set(ranges)), "the same window must never be asked twice")
+        self.assertIn("窗口", str(caught.exception))
+        self.assertIn("id_ceiling", str(caught.exception))
 
-    def test_a_tag_limit_error_is_not_retried_on_another_page(self):
+    def test_the_meta_records_the_id_window_and_the_ceiling(self):
+        http = FakeHttp([[sample_post()], b"IMAGEBYTES"])
+        self.ns["http_get"] = http
+        self.ns["load_image_tensor"] = lambda data: data
+        with tempfile.TemporaryDirectory() as cache_dir:
+            result = self.node.fetch_random_post(
+                query_tags="rating:general", seed=3, cache_dir=cache_dir
+            )
+
+        meta = json.loads(result[6])
+        self.assertEqual(meta["mode"], "id")
+        self.assertEqual(meta["id_ceiling"], self.ns["DEFAULT_ID_CEILING"])
+        self.assertRegex(meta["id_window"], r"^\d+\.\.\d+$")
+        self.assertRegex(meta["anchor"].__str__(), r"^\d+$")
+
+    def test_a_tag_limit_error_is_not_retried_in_another_window(self):
         error = self.ns["DanbooruError"]("You cannot search for more than 2 tags at a time.")
         error.status = 422
         http = FakeHttp([error, error, error])
@@ -1062,7 +1120,7 @@ class DanbooruNamespaceTests(unittest.TestCase):
             with self.assertRaises(self.ns["DanbooruError"]):
                 self.node.fetch_random_post(query_tags="1girl solo", seed=7, cache_dir=cache_dir)
 
-        self.assertEqual(len(http.urls), 1, "a 422 cannot change by asking another page")
+        self.assertEqual(len(http.urls), 1, "a 422 cannot change by asking another window")
 
     def test_the_pinned_fallback_moves_to_the_next_address_after_a_server_error(self):
         payload = json.dumps([sample_post()]).encode("utf-8")
